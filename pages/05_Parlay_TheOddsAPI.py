@@ -1,3 +1,4 @@
+```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/87d1805ef94734d595c507e2835df65292d028bc/pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (debug-friendly)
 
@@ -6,6 +7,8 @@ This file:
 - Auto-shows candidate pool when Preview finds no picks (no manual edits required)
 - Color-coded safety badges and DraftKings search links
 - All helper functions present before UI
+- Includes robustness fixes: safe price parsing, skip events without stable id,
+  stable remove keys, immediate download button, and defensive numeric defaults.
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -47,6 +50,15 @@ if not API_KEY:
 def _safe_name(o: Dict[str, Any]) -> str:
     return o.get("name") or o.get("participant") or o.get("label") or ""
 
+# ---- Price helper (use across consensus / safety calculations) ----
+def _safe_price_from_outcome(o: Dict[str, Any]) -> Optional[float]:
+    """Return a float price from an outcome dict checking common keys, or None."""
+    raw = o.get("price") or o.get("decimal") or o.get("odds")
+    try:
+        return float(raw) if raw is not None else None
+    except Exception:
+        return None
+
 @st.cache_data(ttl=300)
 def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
     url = f"https://api.the-odds-api.com/v4/sports/?apiKey={api_key}"
@@ -72,18 +84,15 @@ def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = No
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
                 name = _safe_name(o)
-                price = o.get("price") or o.get("decimal") or o.get("odds")
-                try:
-                    price = float(price)
-                except Exception:
-                    price = None
-                if price and name:
-                    outcomes.append({
-                        "name": name,
-                        "price": price,
-                        "market": m.get("key"),
-                        "bookmaker": bm.get("key"),
-                    })
+                price = _safe_price_from_outcome(o)
+                if price is None or not name:
+                    continue
+                outcomes.append({
+                    "name": name,
+                    "price": price,
+                    "market": m.get("key"),
+                    "bookmaker": bm.get("key"),
+                })
     return outcomes
 
 def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -92,9 +101,8 @@ def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
                 name = _safe_name(o)
-                try:
-                    price = float(o.get("price"))
-                except Exception:
+                price = _safe_price_from_outcome(o)
+                if price is None:
                     continue
                 price_map.setdefault(name, []).append(price)
 
@@ -135,7 +143,8 @@ def get_outcome_safety_metrics(event: Dict[str, Any]) -> List[Dict[str, Any]]:
         best = o["best_price"]
         worst = o["worst_price"]
         spread_pct = abs(worst - best) / cons if cons else 0.0
-        implied_consensus = (1.0 / cons) if cons > 0 else None
+        # default to 0.0 for numeric stability
+        implied_consensus = (1.0 / cons) if cons and cons > 0 else 0.0
         metrics.append({
             "name": o["name"],
             "consensus": cons,
@@ -172,7 +181,10 @@ def auto_pick_legs_by_value(
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for ev in events:
-        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        # require a stable id; skip otherwise
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or None
+        if not ev_id:
+            continue
         title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
         # compute consensus and best prices for outcomes
         price_map: Dict[str, List[float]] = {}
@@ -180,9 +192,8 @@ def auto_pick_legs_by_value(
             for m in bm.get("markets", []):
                 for o in m.get("outcomes", []):
                     name = _safe_name(o)
-                    try:
-                        price = float(o.get("price"))
-                    except Exception:
+                    price = _safe_price_from_outcome(o)
+                    if price is None:
                         continue
                     price_map.setdefault(name, []).append(price)
 
@@ -192,7 +203,7 @@ def auto_pick_legs_by_value(
             cons = median(prices)
             best = max(prices)
             value = (best / cons - 1.0) if cons else 0.0
-            implied_consensus = (1.0 / cons) if cons > 0 else None
+            implied_consensus = (1.0 / cons) if cons and cons > 0 else 0.0
             favorite_flag = cons < 2.0 if cons else False
             candidates.append({
                 "event_id": ev_id,
@@ -251,6 +262,10 @@ def auto_pick_safest_legs(
     require_bookmaker: Optional[str] = "draftkings",
     avoid_same_event: bool = True,
 ) -> List[Dict[str, Any]]:
+    """
+    Conservative picks: prefer outcomes with high consensus (implied prob),
+    low inter-book spread, and odds <= max_decimal_odds.
+    """
     candidates: List[Dict[str, Any]] = []
     for ev in events:
         if require_bookmaker:
@@ -262,7 +277,9 @@ def auto_pick_safest_legs(
             if not found:
                 continue
 
-        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or None
+        if not ev_id:
+            continue
         title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
         metrics = get_outcome_safety_metrics(ev)
         for m in metrics:
@@ -292,7 +309,7 @@ def auto_pick_safest_legs(
             })
 
     # sort by safety_score then implied_consensus
-    candidates.sort(key=lambda c: (c["safety_score"], c["implied_consensus"]), reverse=True)
+    candidates.sort(key=lambda c: (c.get("safety_score", 0.0), c.get("implied_consensus", 0.0)), reverse=True)
 
     selected: List[Dict[str, Any]] = []
     used_events = set()
@@ -515,12 +532,8 @@ with left_col:
                             mkey = m.get("key") or "market"
                             for o in m.get("outcomes", []):
                                 name = _safe_name(o)
-                                price = o.get("price") or o.get("decimal") or o.get("odds")
-                                try:
-                                    price = float(price)
-                                except Exception:
-                                    price = None
-                                if not price or not name:
+                                price = _safe_price_from_outcome(o)
+                                if price is None or not name:
                                     continue
                                 row_cols = st.columns([6, 1])
                                 row_cols[0].write(f"{name}  —  {price}  (market: {mkey} | bm: {bm_key})")
@@ -759,17 +772,20 @@ with right_col:
         st.session_state.parlay = []
         st.success("Parlay cleared.")
 
-    # Manage picks
+    # Manage picks (stable keys, remove by matching values to avoid index shift)
     st.subheader("Manage picks")
     if not st.session_state.parlay:
         st.info("No picks to manage.")
     else:
-        for idx, leg in enumerate(list(st.session_state.parlay)):
+        for leg in list(st.session_state.parlay):
             cols = st.columns([4, 1])
             cols[0].markdown(f"**{leg.get('sport','')}** — {leg.get('title','')}  \n> **{leg.get('selection','')}**  @ {leg.get('price')}")
-            rem_key = "rem-" + hashlib.sha1(f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}".encode()).hexdigest()[:12]
+            unique_key_src = f"{leg.get('event_id','')}-{leg.get('selection','')}"
+            rem_key = "rem-" + hashlib.sha1(unique_key_src.encode()).hexdigest()[:12]
             if cols[1].button("Remove", key=rem_key):
-                st.session_state.parlay.pop(idx)
+                # remove all matching legs with same event_id and selection (defensive)
+                st.session_state.parlay = [l for l in st.session_state.parlay if not (l.get("event_id") == leg.get("event_id") and l.get("selection") == leg.get("selection"))]
+                st.experimental_rerun()
 
     # Parlay metrics & export
     st.markdown("---")
@@ -785,9 +801,10 @@ with right_col:
         st.metric("Combined decimal odds", f"{combined:.4f}")
         st.metric("Potential payout", f"${payout:,.2f}")
         st.metric("Potential profit", f"${profit:,.2f}")
-        if st.button("Export parlay JSON"):
-            st.download_button("Download JSON", data=json.dumps(st.session_state.parlay, default=str, indent=2), file_name="parlay.json", mime="application/json")
+        # Export JSON: show direct download button (no extra click)
+        st.download_button("Download parlay JSON", data=json.dumps(st.session_state.parlay, default=str, indent=2), file_name="parlay.json", mime="application/json")
     else:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
+```
