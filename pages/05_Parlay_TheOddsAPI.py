@@ -1,9 +1,9 @@
-# Parlay Builder — TheOddsAPI prototype (safe-only, DraftKings removed)
+```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/main/pages/05_Parlay_TheOddsAPI.py
+# Parlay Builder — TheOddsAPI prototype (safe-only, show top safe candidates)
 #
-# This simplified version removes DraftKings search links and related HTML.
-# Focus is on loading events, auto-pick (value + safest) and parlay management.
-# Includes robustness fixes (safe price parsing, skip events without stable id,
-# stable remove keys, immediate JSON download).
+# Focuses on reliable auto-pick behavior and a new "Show top N safe candidates" view.
+# Robustness: safe price parsing, skip events without stable id, stable remove keys,
+# immediate JSON download and defensive numeric defaults.
 from typing import Any, Dict, List, Optional
 import os
 import hashlib
@@ -387,7 +387,7 @@ with left_col:
         max_decimal_odds = st.number_input("Max decimal odds per leg", value=1.8, step=0.05, format="%.2f")
         min_consensus_prob = st.slider("Minimum consensus implied probability (%)", min_value=30, max_value=90, value=60) / 100.0
         max_spread_pct = st.slider("Max spread across books (%)", min_value=0, max_value=20, value=5) / 100.0
-        require_bm = st.text_input("Require bookmaker (leave blank for any)", value="draftkings")
+        require_bm = st.text_input("Require bookmaker (leave blank for any)", value="")
 
         def _auto_pick_source_events():
             s_events = st.session_state.events[:]
@@ -465,18 +465,56 @@ with left_col:
             else:
                 for p in picks:
                     st.write(f"{p.get('sport_title') or ''} — {p['event_title']}\n  {p['selection']} @ {p['price']} — {p['reason']}")
-        if st.button("Add safest picks"):
-            picks = auto_pick_safest_legs(_auto_pick_source_events(), n_legs=int(auto_n), max_decimal_odds=float(max_decimal_odds), min_consensus_prob=float(min_consensus_prob), max_spread_pct=float(max_spread_pct), require_bookmaker=(require_bm if require_bm.strip() else None), avoid_same_event=avoid_same_event)
-            if not picks:
-                st.warning("No safe picks found.")
-            else:
-                added = 0
-                for p in picks:
-                    exists = any((leg.get("event_id") == p["event_id"] and leg.get("selection") == p["selection"]) for leg in st.session_state.parlay)
-                    if not exists:
-                        st.session_state.parlay.append({"event_id": p["event_id"], "sport": p.get("sport_title") or "", "title": p["event_title"], "selection": p["selection"], "price": p["price"], "commence_time": p.get("commence_time"), "reason": p.get("reason")})
-                        added += 1
-                st.success(f"Added {added} safe picks to parlay.")
+
+        # NEW: show top N safe candidates (detailed list + per-row Add button)
+        st.markdown("---")
+        st.markdown("### Show top safe candidates")
+        top_n = st.number_input("Top N safe candidates to show", min_value=1, max_value=50, value=10)
+        if st.button("Show top safe candidates"):
+            # gather a relaxed pool of safe candidates sorted by safety_score
+            candidates = auto_pick_safest_legs(
+                _auto_pick_source_events(),
+                n_legs=200,
+                max_decimal_odds=5.0,
+                min_consensus_prob=0.0,
+                max_spread_pct=1.0,
+                require_bookmaker=(require_bm if require_bm.strip() else None),
+                avoid_same_event=False
+            )
+            count = len(candidates)
+            st.write(f"Found {count} safe candidates — showing top {min(top_n, count)}")
+            for i, c in enumerate(candidates[:top_n]):
+                c_sport = c.get("sport_title") or c.get("sport_key") or ""
+                c_event = c.get("event_title") or ""
+                c_sel = c.get("selection") or ""
+                c_price = c.get("price")
+                c_implied = (c.get("implied_consensus") or 0.0) * 100.0
+                c_spread = (c.get("spread_pct") or 0.0) * 100.0
+                c_score = c.get("safety_score") or 0.0
+                row_cols = st.columns([0.5, 2, 3, 2, 1, 1, 1])
+                row_cols[0].write(f"{i+1}")
+                row_cols[1].write(c_sport)
+                row_cols[2].write(c_event)
+                row_cols[3].write(f"**{c_sel}**  @ {c_price:.2f}")
+                row_cols[4].write(f"{c_implied:.1f}%")
+                row_cols[5].write(f"{c_spread:.2f}%")
+                add_key = "addsafe-" + hashlib.sha1(f"{c.get('event_id','')}|{c_sel}".encode()).hexdigest()[:12]
+                if row_cols[6].button("Add", key=add_key):
+                    exists = any((leg.get("event_id") == c.get("event_id") and leg.get("selection") == c_sel) for leg in st.session_state.parlay)
+                    if exists:
+                        st.warning("Selection already in parlay.")
+                    else:
+                        st.session_state.parlay.append({
+                            "event_id": c.get("event_id"),
+                            "sport": c_sport,
+                            "title": c_event,
+                            "selection": c_sel,
+                            "price": c_price,
+                            "commence_time": c.get("commence_time"),
+                            "reason": f"Auto-safe (score {c_score:.3f})"
+                        })
+                        st.success("Added to parlay.")
+                        # small optimization: you might want to immediately re-show candidates; skip rerun to avoid losing the list view
 
     # Debug tab
     with tabs[2]:
@@ -544,3 +582,4 @@ with right_col:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
+```
