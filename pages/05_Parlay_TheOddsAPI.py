@@ -1,11 +1,11 @@
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
-Auto-pick improvements:
- - can auto-add picks (no manual add required)
- - optional filter: DraftKings events starting before 11:00 Pacific today
- - improved widget keys to avoid StreamlitDuplicateElementKey errors
-Fix: removed explicit st.experimental_rerun() calls to avoid AttributeError.
+Fixes:
+ - attach sport metadata to events so picks display sport/title/time
+ - store sport and commence_time in parlay legs
+ - improved display of selected legs (sport, start time, event, selection)
+ - removed experimental_rerun usages and kept stable widget keys
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -176,7 +176,11 @@ def auto_pick_legs_by_value(
                 "value": value,
                 "implied_consensus": implied_consensus,
                 "implied_best": implied_best,
-                "favorite": favorite_flag
+                "favorite": favorite_flag,
+                # pass sport metadata through if present
+                "sport_key": ev.get("_sport_key"),
+                "sport_title": ev.get("_sport_title"),
+                "commence_time": ev.get("commence_time") or ev.get("start")
             })
 
     candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
@@ -201,13 +205,16 @@ def auto_pick_legs_by_value(
         reason = " — ".join(reason_parts)
         selected.append({
             "event_id": c["event_id"],
+            "sport_key": c.get("sport_key"),
+            "sport_title": c.get("sport_title"),
             "event_title": c["event_title"],
             "selection": c["selection"],
             "price": c["price"],
             "consensus": c["consensus"],
             "value": c["value"],
             "implied_consensus": c["implied_consensus"],
-            "reason": reason
+            "reason": reason,
+            "commence_time": c.get("commence_time")
         })
         used_events.add(c["event_id"])
     return selected
@@ -244,12 +251,18 @@ events: List[Dict[str, Any]] = []
 
 if selected_sport:
     try:
-        events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
+        raw_events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
+        # attach sport metadata onto each event for display & downstream logic
+        sport_title = sport_options.get(selected_sport, selected_sport)
+        for ev in raw_events:
+            ev["_sport_key"] = selected_sport
+            ev["_sport_title"] = sport_title
+        events = raw_events
     except Exception as e:
         st.sidebar.error(f"Could not load odds: {e}")
         events = []
 
-# Sample fallback
+# Sample fallback (include sport metadata)
 if not events:
     st.info("No live feed loaded — using sample events.")
     events = [
@@ -260,7 +273,9 @@ if not events:
             "teams": ["Ma Long", "Fan Zhendong"],
             "bookmakers": [
                 {"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Ma Long","price":1.45},{"name":"Fan Zhendong","price":2.10}]}]}
-            ]
+            ],
+            "_sport_key": "table_tennis",
+            "_sport_title": "Table Tennis"
         },
         {
             "id": "ev-2",
@@ -269,7 +284,9 @@ if not events:
             "teams": ["Player A", "Player B"],
             "bookmakers": [
                 {"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Player A","price":1.80},{"name":"Player B","price":2.00}]}]}
-            ]
+            ],
+            "_sport_key": "demo_sport",
+            "_sport_title": "Demo Sport"
         }
     ]
 
@@ -277,16 +294,22 @@ if not events:
 if "parlay" not in st.session_state:
     st.session_state.parlay = []
 
-def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float) -> None:
-    # don't call st.experimental_rerun() here — Streamlit reruns automatically after widget interaction
+def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title: Optional[str] = None, commence_time: Optional[str] = None) -> None:
+    # prevent duplicate same-event leg
     for leg in st.session_state.parlay:
         if leg["event_id"] == ev_id:
             st.warning("You already added a leg from this event. Remove it first to add another selection.")
             return
-    st.session_state.parlay.append({"event_id": ev_id, "title": ev_title, "selection": sel_name, "price": price})
+    st.session_state.parlay.append({
+        "event_id": ev_id,
+        "sport": sport_title or "",
+        "title": ev_title,
+        "selection": sel_name,
+        "price": price,
+        "commence_time": commence_time
+    })
 
 def remove_leg(i: int) -> None:
-    # don't call st.experimental_rerun() here
     if 0 <= i < len(st.session_state.parlay):
         st.session_state.parlay.pop(i)
 
@@ -298,13 +321,17 @@ with left:
     for ev in events:
         ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
         title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        sport_title = ev.get("_sport_title") or ev.get("_sport_key") or ""
+        commence = ev.get("commence_time") or ev.get("start") or ""
         outs = extract_outcomes(ev, bookmaker_filter=bookmaker_filter)
         if not outs:
             with st.expander(f"{title} (no odds)"):
                 st.write("No usable odds/outcomes found for this event.")
             continue
 
-        with st.expander(title):
+        header = f"{sport_title} — {title}"
+        with st.expander(header):
+            st.write("Start:", commence)
             for o in outs:
                 cols = st.columns([4, 1])
                 cols[0].write(f"{o['name']}  —  {o['price']} (market: {o['market']} | bm: {o['bookmaker']})")
@@ -313,7 +340,7 @@ with left:
                 add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
 
                 if cols[1].button("Add", key=add_key):
-                    add_leg(ev_id, title, o["name"], o["price"])
+                    add_leg(ev_id, title, o["name"], o["price"], sport_title=sport_title, commence_time=commence)
 
 with right:
     st.header("Parlay builder")
@@ -350,14 +377,16 @@ with right:
         else:
             st.success(f"Found {len(picks)} pick(s). {'Previewing — not added.' if preview_only else 'Added to parlay.'}")
             for p in picks:
-                with st.expander(f"{p['event_title']} — {p['selection']} @ {p['price']}"):
+                p_sport = p.get("sport_title") or p.get("sport_key") or ""
+                p_ct = p.get("commence_time") or ""
+                with st.expander(f"{p_sport} — {p['event_title']} — {p['selection']} @ {p['price']}"):
                     st.write("Reason:", p["reason"])
                     st.write(f"Consensus: {p['consensus']:.2f} | Value uplift: {p['value']*100:.2f}%")
                     if p.get("implied_consensus"):
                         kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
                         st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
                     if not preview_only:
-                        add_leg(p['event_id'], p['event_title'], p['selection'], p['price'])
+                        add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p_sport, commence_time=p_ct)
 
     # ---- Current parlay UI ----
     legs = st.session_state.parlay
@@ -366,11 +395,12 @@ with right:
     else:
         for idx, leg in enumerate(legs):
             c = st.columns([3, 1])
-            c[0].markdown(f"**{leg['title']}** — {leg['selection']} @ {leg['price']}")
-
+            # show sport, start time, event, and selection clearly
+            start_txt = f" • starts {leg['commence_time']}" if leg.get("commence_time") else ""
+            c[0].markdown(f"**{leg.get('sport','')}** — **{leg.get('title','')}**{start_txt}  \n"
+                          f"> {leg.get('selection','')}  @ {leg.get('price')}")
             rem_raw = f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}"
             rem_key = "rem-" + hashlib.sha1(rem_raw.encode()).hexdigest()[:12]
-
             if c[1].button("Remove", key=rem_key):
                 remove_leg(idx)
 
