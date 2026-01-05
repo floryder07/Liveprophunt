@@ -1,4 +1,3 @@
-```python name=parlay_builder.py
 # Parlay Builder — TheOddsAPI prototype (safe-only, show top safe candidates)
 #
 # Focuses on reliable auto-pick behavior and a new "Show top N safe candidates" view.
@@ -512,37 +511,10 @@ with left_col:
                 for p in picks:
                     st.write(f"{p.get('sport_title') or ''} — {p['event_title']}\n  {p['selection']} @ {p['price']} — {p['reason']}")
 
-        # Show top N safe candidates (improved display, ID toggle, auto-load helper)
+        # NEW: show top N safe candidates (detailed list + per-row Add button)
         st.markdown("---")
         st.markdown("### Show top safe candidates")
         top_n = st.number_input("Top N safe candidates to show", min_value=1, max_value=50, value=10)
-        show_full_id = st.checkbox("Show full event id (debug)", value=False)
-
-        # Auto-load events when API key present AND scan_all_sports is checked (manual confirmation)
-        if API_KEY and scan_all_sports:
-            if st.button("Auto-load all sports now (API key present & Scan all sports enabled)"):
-                with st.spinner("Loading events from all sports (may be slow)..."):
-                    try:
-                        sports_list = fetch_sports(API_KEY)
-                        loaded: List[Dict[str, Any]] = []
-                        for s in sports_list:
-                            skey = s.get("key")
-                            stitle = s.get("title")
-                            try:
-                                evs = fetch_odds_for_sport(API_KEY, skey, regions, markets, int(odds_ttl))
-                            except Exception:
-                                # skip if fetch fails (rate limits / unsupported)
-                                continue
-                            for ev in evs:
-                                ev["_sport_key"] = skey
-                                ev["_sport_title"] = stitle
-                            loaded.extend(evs)
-                        _ensure_sport_titles(loaded, sports_list)
-                        st.session_state.events = loaded
-                        st.success(f"Loaded {len(loaded)} events (scan all sports).")
-                    except Exception as e:
-                        st.error(f"Could not load events: {e}")
-
         if st.button("Show top safe candidates"):
             # gather a relaxed pool of safe candidates sorted by safety_score
             candidates = auto_pick_safest_legs(
@@ -555,42 +527,22 @@ with left_col:
                 avoid_same_event=False
             )
             count = len(candidates)
-            shown = min(top_n, count)
-            st.write(f"Found {count} safe candidates — showing top {shown}")
-
-            # Header row
-            hdr_cols = st.columns([0.5, 2, 4, 3, 1.2, 1.2, 1])
-            hdr_cols[0].write("#")
-            hdr_cols[1].write("Sport")
-            hdr_cols[2].write("Event")
-            hdr_cols[3].write("Selection / Start")
-            hdr_cols[4].write("Implied %")
-            hdr_cols[5].write("Spread %")
-            hdr_cols[6].write("Score")
-
+            st.write(f"Found {count} safe candidates — showing top {min(top_n, count)}")
             for i, c in enumerate(candidates[:top_n]):
                 c_sport = c.get("sport_title") or c.get("sport_key") or ""
                 c_event = c.get("event_title") or ""
-                # if the title looks like a long id, shorten it unless the user asked to show the full id
-                display_title = c_event if len(str(c_event)) <= 40 or show_full_id else (str(c_event)[:37] + "...")
                 c_sel = c.get("selection") or ""
-                c_price = float(c.get("price") or 0.0)
+                c_price = c.get("price")
                 c_implied = (c.get("implied_consensus") or 0.0) * 100.0
                 c_spread = (c.get("spread_pct") or 0.0) * 100.0
                 c_score = c.get("safety_score") or 0.0
-                commence = c.get("commence_time") or ""
-
-                row_cols = st.columns([0.5, 2, 4, 3, 1.2, 1.2, 1])
+                row_cols = st.columns([0.5, 2, 3, 2, 1, 1, 1])
                 row_cols[0].write(f"{i+1}")
                 row_cols[1].write(c_sport)
-                # show (possibly truncated) event title
-                row_cols[2].markdown(f"{display_title}")
-                # selection and start time
-                row_cols[3].markdown(f"**{c_sel}**  @ {c_price:.2f}\n\n{commence}")
+                row_cols[2].write(c_event)
+                row_cols[3].write(f"**{c_sel}**  @ {c_price:.2f}")
                 row_cols[4].write(f"{c_implied:.1f}%")
                 row_cols[5].write(f"{c_spread:.2f}%")
-                row_cols[6].write(f"{c_score:.3f}")
-
                 add_key = "addsafe-" + hashlib.sha1(f"{c.get('event_id','')}|{c_sel}".encode()).hexdigest()[:12]
                 if row_cols[6].button("Add", key=add_key):
                     exists = any((leg.get("event_id") == c.get("event_id") and leg.get("selection") == c_sel) for leg in st.session_state.parlay)
@@ -674,4 +626,3 @@ with right_col:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
-```
