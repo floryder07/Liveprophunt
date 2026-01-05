@@ -1,15 +1,13 @@
 """
-Parlay Builder — TheOddsAPI prototype (Streamlit)
+Parlay Builder — TheOddsAPI prototype
 
-Updates in this version:
-- "Picked summary" panel: a compact, colored summary table showing sport, event, selection, start time, price and reason
-- Color-coded safety/value badges for picks (green/yellow/red)
-- Option to scan all sports (sidebar) so auto-picks can consider every sport (attaches sport metadata to events)
-- "Clear parlay" button
-- Fixes to ensure sport & player/selection names display correctly for manual and auto-added picks
-- Stable hashed widget keys; removed experimental_rerun usage
-Notes:
-- Scanning all sports may be rate-limited by TheOddsAPI free tier. Use with care.
+Fixes in this version:
+- Ensures every event loaded has sport metadata (_sport_key/_sport_title) so picks always show sport.
+- When adding a leg (manual or auto), we now store a 'reason' with the leg so the picked-summary table can display it.
+- Manual "Add" button computes a short reason for the selection (consensus vs best) so manual adds look the same as auto-picks.
+- Better fallbacks for selection names (participant/label/etc) to avoid empty selection names.
+- Minor UI polishing for the picked-summary so sport/title/selection always show and the colored badge maps to sport title.
+- Kept previous features (auto-pick by value/safety, DraftKings before 11 PT filter, scan-all-sports).
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -96,6 +94,10 @@ def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], 
     resp.raise_for_status()
     return resp.json()
 
+def _safe_name(o: Dict[str, Any]) -> str:
+    """Return the best available name for an outcome/participant."""
+    return o.get("name") or o.get("participant") or o.get("label") or ""
+
 def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     outcomes: List[Dict[str, Any]] = []
     for bm in event.get("bookmakers", []):
@@ -104,14 +106,15 @@ def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = No
                 continue
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
+                name = _safe_name(o)
                 price = o.get("price") or o.get("decimal") or o.get("odds")
                 try:
                     price = float(price)
                 except Exception:
                     price = None
-                if price:
+                if price and name:
                     outcomes.append({
-                        "name": o.get("name") or o.get("participant") or o.get("label"),
+                        "name": name,
                         "price": price,
                         "market": m.get("key"),
                         "bookmaker": bm.get("key"),
@@ -132,7 +135,7 @@ def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any
     for bm in event.get("bookmakers", []):
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
-                name = o.get("name") or o.get("participant") or o.get("label")
+                name = _safe_name(o)
                 try:
                     price = float(o.get("price"))
                 except Exception:
@@ -153,6 +156,22 @@ def score_outcome_value(consensus: float, best_price: float) -> float:
     if consensus <= 0:
         return 0.0
     return (best_price / consensus) - 1.0
+
+def get_reason_for_selection(event: Dict[str, Any], selection_name: str) -> str:
+    """Compute a short reason string (consensus vs best) for a manual Add action."""
+    outs = get_consensus_and_best_outcomes(event)
+    for o in outs:
+        if o["name"] == selection_name:
+            cons = o["consensus"]
+            best = o["best_price"]
+            if cons and best:
+                uplift = (best / cons - 1.0) * 100.0
+                implied_cons = (1.0 / cons) * 100.0 if cons else None
+                reason = f"Best price {best:.2f} vs consensus {cons:.2f} ({uplift:.1f}% uplift)"
+                if implied_cons:
+                    reason += f" — implied {implied_cons:.1f}%"
+                return reason
+    return "No reason available"
 
 def get_outcome_safety_metrics(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     metrics: List[Dict[str, Any]] = []
@@ -200,7 +219,7 @@ def auto_pick_legs_by_value(
                 "favorite": favorite_flag,
                 "sport_key": ev.get("_sport_key"),
                 "sport_title": ev.get("_sport_title"),
-                "commence_time": ev.get("commence_time") or ev.get("start")
+                "commence_time": ev.get("commence_time") or ev.get("start"),
             })
 
     candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
@@ -231,7 +250,7 @@ def auto_pick_legs_by_value(
             "value": c["value"],
             "implied_consensus": c["implied_consensus"],
             "reason": reason,
-            "commence_time": c.get("commence_time")
+            "commence_time": c.get("commence_time"),
         })
         used_events.add(c["event_id"])
     return selected
@@ -282,7 +301,7 @@ def auto_pick_safest_legs(
                 "safety_score": safety_score,
                 "sport_key": ev.get("_sport_key"),
                 "sport_title": ev.get("_sport_title"),
-                "commence_time": ev.get("commence_time") or ev.get("start")
+                "commence_time": ev.get("commence_time") or ev.get("start"),
             })
 
     candidates.sort(key=lambda c: (c["safety_score"], c["implied_consensus"]), reverse=True)
@@ -307,7 +326,7 @@ def auto_pick_safest_legs(
             "price": c["price"],
             "reason": reason,
             "safety_score": c["safety_score"],
-            "commence_time": c.get("commence_time")
+            "commence_time": c.get("commence_time"),
         })
         used_events.add(c["event_id"])
     return selected
@@ -324,14 +343,13 @@ def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
     return max(0.0, f * raw)
 
 def color_for_prob(p: Optional[float]) -> str:
-    # Return a CSS color code based on implied probability p
     if p is None:
         return "#999999"
     if p >= 0.65:
-        return "#2ECC71"  # green
+        return "#2ECC71"
     if p >= 0.5:
-        return "#F1C40F"  # yellow
-    return "#E67E22"  # orange
+        return "#F1C40F"
+    return "#E67E22"
 
 # ---- UI: sports selector ----
 sports: List[Dict[str, Any]] = []
@@ -353,7 +371,6 @@ load_odds_btn = st.sidebar.button("Load odds for sport(s)")
 events: List[Dict[str, Any]] = []
 
 if load_odds_btn:
-    # If scan_all_sports, iterate all sports; otherwise only selected_sport
     try:
         if scan_all_sports:
             all_events: List[Dict[str, Any]] = []
@@ -415,7 +432,8 @@ if not events:
 if "parlay" not in st.session_state:
     st.session_state.parlay = []
 
-def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title: Optional[str] = None, commence_time: Optional[str] = None) -> None:
+def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title: Optional[str] = None, commence_time: Optional[str] = None, reason: Optional[str] = None) -> None:
+    # prevent duplicate same-event+selection
     for leg in st.session_state.parlay:
         if leg["event_id"] == ev_id and leg["selection"] == sel_name:
             st.warning("That leg is already in the parlay. Remove it first to add again.")
@@ -426,7 +444,8 @@ def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title:
         "title": ev_title,
         "selection": sel_name,
         "price": price,
-        "commence_time": commence_time
+        "commence_time": commence_time,
+        "reason": reason or ""
     })
 
 def remove_leg(i: int) -> None:
@@ -463,7 +482,9 @@ with left:
                 add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
 
                 if cols[1].button("Add", key=add_key):
-                    add_leg(ev_id, title, o["name"], o["price"], sport_title=sport_title, commence_time=commence)
+                    # compute a reason for manual add so the picked summary has consistent info
+                    reason = get_reason_for_selection(ev, o["name"])
+                    add_leg(ev_id, title, o["name"], o["price"], sport_title=sport_title, commence_time=commence, reason=reason)
 
 with right:
     st.header("Parlay builder")
@@ -480,7 +501,6 @@ with right:
     picked_html += "<table class='picks'><thead><tr><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Reason</th></tr></thead><tbody>"
     for leg in st.session_state.parlay:
         prob = None
-        # try to infer implied prob from price
         try:
             prob = 1.0 / float(leg.get("price", 0))
         except Exception:
@@ -542,13 +562,12 @@ with right:
         else:
             st.success(f"Found {len(picks)} value pick(s).")
             for p in picks:
-                # display pick summary and optionally add
                 p_sport = p.get("sport_title") or p.get("sport_key") or ""
                 p_ct = p.get("commence_time") or ""
                 st.markdown(f"**{p_sport}** — {p['event_title']} — **{p['selection']}** @ {p['price']}")
                 st.write(p["reason"])
                 if not preview_only:
-                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p_sport, commence_time=p_ct)
+                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p_sport, commence_time=p_ct, reason=p.get("reason"))
 
     if st.button("Auto-pick (safest)"):
         filtered_events = events
@@ -585,30 +604,30 @@ with right:
                 st.markdown(f"**{p.get('sport_title') or ''}** — {p['event_title']} — **{p['selection']}** @ {p['price']}")
                 st.write(p["reason"])
                 if not preview_only:
-                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p.get("sport_title"), commence_time=p.get("commence_time"))
+                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p.get("sport_title"), commence_time=p.get("commence_time"), reason=p.get("reason"))
 
     st.markdown("---")
     # Current parlay UI (detailed)
     st.subheader("Current parlay")
-    legs = st.session_state.parlay
-    cols = st.columns([1, 1])
     if st.button("Clear parlay"):
         clear_parlay()
+    legs = st.session_state.parlay
     if not legs:
         st.info("No legs added. Use Auto-pick or Add buttons on the left.")
     else:
         for idx, leg in enumerate(legs):
-            c = st.columns([4, 1])
-            start_txt = f" • starts {leg['commence_time']}" if leg.get("commence_time") else ""
-            sport_chip = f"<span style='background:{color_for_prob(1.0/leg['price'] if leg.get('price') else None)};color:#fff;padding:4px 8px;border-radius:999px;font-size:12px'>{leg.get('sport','')}</span>"
+            color = color_for_prob(1.0/leg['price'] if leg.get('price') else None)
+            sport_chip = f"<span style='background:{color};color:#fff;padding:4px 8px;border-radius:999px;font-size:12px'>{leg.get('sport','')}</span>"
+            start_txt = f" • starts {leg.get('commence_time')}" if leg.get('commence_time') else ""
             st.markdown(f"{sport_chip}  **{leg.get('title','')}**{start_txt}  \n> **{leg.get('selection','')}**  @ {leg.get('price')}", unsafe_allow_html=True)
             rem_raw = f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}"
             rem_key = "rem-" + hashlib.sha1(rem_raw.encode()).hexdigest()[:12]
-            if c[1].button("Remove", key=rem_key):
+            if st.button("Remove", key=rem_key):
                 remove_leg(idx)
 
     st.markdown("---")
     stake = st.number_input("Stake", value=10.0, min_value=0.0, format="%.2f")
+    legs = st.session_state.parlay
     if legs:
         prices = [l["price"] for l in legs]
         combined = prod(prices)
