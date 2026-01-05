@@ -1,22 +1,21 @@
-```python name=pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
-Merged with an "auto-pick" feature that selects legs based on market value
-(best bookmaker price vs market consensus) and explains why each pick was chosen.
-
-Usage:
-- Provide THEODDS_API_KEY via env or paste in the sidebar.
-- Load sport odds, then use "Auto-pick by market value" to preview or add picks.
-- This is a recommendation/simulation tool only.
+Auto-pick improvements:
+ - can auto-add picks (no manual add required)
+ - optional filter: DraftKings events starting before 11:00 Pacific today
+ - improved widget keys to avoid StreamlitDuplicateElementKey errors
 """
 from typing import Any, Dict, List, Optional
 import os
 import hashlib
 import requests
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, time, timezone
 from statistics import median
+
+# zoneinfo is available in Python 3.9+
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Parlay Builder — TheOddsAPI", page_icon="🎯", layout="wide")
 st.title("🎯 Parlay Builder — TheOddsAPI prototype")
@@ -34,10 +33,29 @@ bookmaker_filter = st.sidebar.text_input("Preferred bookmaker key/title (optiona
 odds_ttl = st.sidebar.number_input("Odds cache key (change to bust cache)", min_value=1, value=20, step=1)
 refresh = st.sidebar.button("Reload sports list / clear cache")
 
+# New: auto-filter DraftKings before 11 PT
+filter_dk_before_11_pt = st.sidebar.checkbox("Auto-filter: DraftKings before 11:00 PT", value=False)
+
 if not API_KEY:
     st.sidebar.warning("No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here.")
 
 # ---- Helpers ----
+def parse_iso_datetime(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # prefer dateutil if available
+        from dateutil import parser as date_parser  # type: ignore
+        dt = date_parser.isoparse(s)
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 def decimal_to_american(d: float) -> str:
     if d <= 1:
         return "N/A"
@@ -61,7 +79,6 @@ def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
     resp.raise_for_status()
     return resp.json()
 
-# include cache-bust param so changing the odds_ttl invalidates the cache
 @st.cache_data()
 def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], markets_list: List[str], cache_bust: int) -> List[Dict[str, Any]]:
     regions_q = ",".join(regions_list)
@@ -93,13 +110,17 @@ def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = No
                     })
     return outcomes
 
+def has_draftkings(bookmakers: List[Dict[str, Any]]) -> bool:
+    for bm in bookmakers or []:
+        key = (bm.get("key") or "").lower()
+        title = (bm.get("title") or "").lower()
+        if "draftk" in key or "draftk" in title:
+            return True
+    return False
+
 # --- Auto-pick utilities (value-based heuristic) ---
 def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    For an event, return outcomes with consensus (median across all sources)
-    and best_price (max across bookmakers).
-    """
-    price_map = {}  # name -> list[float]
+    price_map = {}
     for bm in event.get("bookmakers", []):
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
@@ -130,10 +151,6 @@ def auto_pick_legs_by_value(
     min_value: float = 0.02,
     avoid_same_event: bool = True,
 ) -> List[Dict[str, Any]]:
-    """
-    Returns a list of picks:
-      { event_id, event_title, selection, price, consensus, value, implied_consensus, reason }
-    """
     candidates = []
     for ev in events:
         ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
@@ -158,7 +175,6 @@ def auto_pick_legs_by_value(
                 "favorite": favorite_flag
             })
 
-    # sort by value desc, then by best price desc
     candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
 
     selected = []
@@ -193,10 +209,6 @@ def auto_pick_legs_by_value(
     return selected
 
 def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
-    """
-    Conservative Kelly fraction suggestion using implied prob p as model.
-    Returns fraction of bankroll to stake.
-    """
     b = decimal_odds - 1.0
     if b <= 0 or p <= 0:
         return 0.0
@@ -228,7 +240,6 @@ events: List[Dict[str, Any]] = []
 
 if selected_sport:
     try:
-        # include odds_ttl as cache-busting argument
         events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
     except Exception as e:
         st.sidebar.error(f"Could not load odds: {e}")
@@ -293,7 +304,6 @@ with left:
                 cols = st.columns([4, 1])
                 cols[0].write(f"{o['name']}  —  {o['price']} (market: {o['market']} | bm: {o['bookmaker']})")
 
-                # unique key for add button using a stable hash
                 raw_key = f"{ev_id}|{o.get('name','')}|{o.get('market','')}|{o.get('bookmaker','')}"
                 add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
 
@@ -309,9 +319,29 @@ with right:
     auto_min_pct = st.slider("Minimum uplift vs consensus (%)", min_value=0, max_value=50, value=2)
     auto_min_value = auto_min_pct / 100.0
     avoid_same_event = st.checkbox("Avoid >1 leg per event", value=True)
-    preview_only = st.checkbox("Preview only (don't auto-add)", value=True)
+    # default preview_only False so auto-pick can add automatically for faster testing
+    preview_only = st.checkbox("Preview only (don't auto-add)", value=False)
     if st.button("Auto-pick by market value"):
-        picks = auto_pick_legs_by_value(events, n_legs=auto_n, min_value=auto_min_value, avoid_same_event=avoid_same_event)
+        # optionally filter events to DraftKings before 11 PT
+        filtered_events = events
+        if filter_dk_before_11_pt:
+            tz = ZoneInfo("America/Los_Angeles")
+            now = datetime.now(tz)
+            cutoff = datetime.combine(now.date(), time(hour=11, minute=0), tzinfo=tz)
+            fe = []
+            for ev in events:
+                if not has_draftkings(ev.get("bookmakers", [])):
+                    continue
+                ct = ev.get("commence_time") or ev.get("start") or ev.get("commence_time")
+                dt = parse_iso_datetime(ct)
+                if not dt:
+                    continue
+                dt_local = dt.astimezone(tz)
+                if dt_local < cutoff:
+                    fe.append(ev)
+            filtered_events = fe
+
+        picks = auto_pick_legs_by_value(filtered_events, n_legs=auto_n, min_value=auto_min_value, avoid_same_event=avoid_same_event)
         if not picks:
             st.warning("No picks met the criteria.")
         else:
@@ -324,6 +354,7 @@ with right:
                         kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
                         st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
                     if not preview_only:
+                        # add the pick automatically
                         add_leg(p['event_id'], p['event_title'], p['selection'], p['price'])
 
     # ---- Current parlay UI ----
@@ -335,7 +366,6 @@ with right:
             c = st.columns([3, 1])
             c[0].markdown(f"**{leg['title']}** — {leg['selection']} @ {leg['price']}")
 
-            # unique key for remove button
             rem_raw = f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}"
             rem_key = "rem-" + hashlib.sha1(rem_raw.encode()).hexdigest()[:12]
 
@@ -363,4 +393,3 @@ st.caption(
     "Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). "
     "This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing."
 )
-```
