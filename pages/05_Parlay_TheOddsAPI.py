@@ -5,6 +5,7 @@ Auto-pick improvements:
  - can auto-add picks (no manual add required)
  - optional filter: DraftKings events starting before 11:00 Pacific today
  - improved widget keys to avoid StreamlitDuplicateElementKey errors
+Fix: removed explicit st.experimental_rerun() calls to avoid AttributeError.
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -14,8 +15,11 @@ import streamlit as st
 from datetime import datetime, time, timezone
 from statistics import median
 
-# zoneinfo is available in Python 3.9+
-from zoneinfo import ZoneInfo
+# zoneinfo for timezone handling (Python 3.9+)
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # type: ignore
 
 st.set_page_config(page_title="Parlay Builder — TheOddsAPI", page_icon="🎯", layout="wide")
 st.title("🎯 Parlay Builder — TheOddsAPI prototype")
@@ -40,11 +44,11 @@ if not API_KEY:
     st.sidebar.warning("No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here.")
 
 # ---- Helpers ----
-def parse_iso_datetime(s: str) -> Optional[datetime]:
+def parse_iso_datetime(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # prefer dateutil if available
+        # prefer dateutil if available for robust parsing
         from dateutil import parser as date_parser  # type: ignore
         dt = date_parser.isoparse(s)
     except Exception:
@@ -89,7 +93,7 @@ def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], 
     return resp.json()
 
 def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    outcomes = []
+    outcomes: List[Dict[str, Any]] = []
     for bm in event.get("bookmakers", []):
         if bookmaker_filter and bookmaker_filter.strip():
             if bm.get("key") != bookmaker_filter and bm.get("title") != bookmaker_filter:
@@ -110,7 +114,7 @@ def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = No
                     })
     return outcomes
 
-def has_draftkings(bookmakers: List[Dict[str, Any]]) -> bool:
+def has_draftkings(bookmakers: Optional[List[Dict[str, Any]]]) -> bool:
     for bm in bookmakers or []:
         key = (bm.get("key") or "").lower()
         title = (bm.get("title") or "").lower()
@@ -120,7 +124,7 @@ def has_draftkings(bookmakers: List[Dict[str, Any]]) -> bool:
 
 # --- Auto-pick utilities (value-based heuristic) ---
 def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any]]:
-    price_map = {}
+    price_map: Dict[str, List[float]] = {}
     for bm in event.get("bookmakers", []):
         for m in bm.get("markets", []):
             for o in m.get("outcomes", []):
@@ -131,7 +135,7 @@ def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any
                     continue
                 price_map.setdefault(name, []).append(price)
 
-    results = []
+    results: List[Dict[str, Any]] = []
     for name, prices in price_map.items():
         if not prices:
             continue
@@ -151,7 +155,7 @@ def auto_pick_legs_by_value(
     min_value: float = 0.02,
     avoid_same_event: bool = True,
 ) -> List[Dict[str, Any]]:
-    candidates = []
+    candidates: List[Dict[str, Any]] = []
     for ev in events:
         ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
         title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
@@ -177,7 +181,7 @@ def auto_pick_legs_by_value(
 
     candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
 
-    selected = []
+    selected: List[Dict[str, Any]] = []
     used_events = set()
     for c in candidates:
         if len(selected) >= n_legs:
@@ -273,17 +277,18 @@ if not events:
 if "parlay" not in st.session_state:
     st.session_state.parlay = []
 
-def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float):
+def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float) -> None:
+    # don't call st.experimental_rerun() here — Streamlit reruns automatically after widget interaction
     for leg in st.session_state.parlay:
         if leg["event_id"] == ev_id:
             st.warning("You already added a leg from this event. Remove it first to add another selection.")
             return
     st.session_state.parlay.append({"event_id": ev_id, "title": ev_title, "selection": sel_name, "price": price})
-    st.experimental_rerun()
 
-def remove_leg(i: int):
-    st.session_state.parlay.pop(i)
-    st.experimental_rerun()
+def remove_leg(i: int) -> None:
+    # don't call st.experimental_rerun() here
+    if 0 <= i < len(st.session_state.parlay):
+        st.session_state.parlay.pop(i)
 
 # ---- Main layout ----
 left, right = st.columns([2, 1])
@@ -319,16 +324,14 @@ with right:
     auto_min_pct = st.slider("Minimum uplift vs consensus (%)", min_value=0, max_value=50, value=2)
     auto_min_value = auto_min_pct / 100.0
     avoid_same_event = st.checkbox("Avoid >1 leg per event", value=True)
-    # default preview_only False so auto-pick can add automatically for faster testing
     preview_only = st.checkbox("Preview only (don't auto-add)", value=False)
     if st.button("Auto-pick by market value"):
-        # optionally filter events to DraftKings before 11 PT
         filtered_events = events
-        if filter_dk_before_11_pt:
+        if filter_dk_before_11_pt and ZoneInfo is not None:
             tz = ZoneInfo("America/Los_Angeles")
             now = datetime.now(tz)
             cutoff = datetime.combine(now.date(), time(hour=11, minute=0), tzinfo=tz)
-            fe = []
+            fe: List[Dict[str, Any]] = []
             for ev in events:
                 if not has_draftkings(ev.get("bookmakers", [])):
                     continue
@@ -354,7 +357,6 @@ with right:
                         kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
                         st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
                     if not preview_only:
-                        # add the pick automatically
                         add_leg(p['event_id'], p['event_title'], p['selection'], p['price'])
 
     # ---- Current parlay UI ----
