@@ -1,13 +1,11 @@
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
-Improved layout & navigation:
-- Main area split: left (Events + Auto-pick tabs), right (persistent Parlay summary)
-- Search, sport filter, sorting, pagination for event browsing
-- Auto-pick controls centralized in Auto-pick tab
-- Debug tab (collapsed) to inspect raw events & session state
-- Stable widget keys (hashed) to avoid duplicates
-- Keeps conservative defaults (preview-only enabled)
+This file:
+- Ensures _sport_title exists for each event (maps from sports list and fallback keys)
+- Has improved layout with Events / Auto-pick / Debug tabs
+- Shows a Debug panel so you can confirm the feed and sport titles
+- Avoids experimental_rerun calls
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -18,13 +16,12 @@ import streamlit as st
 from datetime import datetime, time, timezone
 from statistics import median
 
-# zoneinfo for timezone handling
+# zoneinfo for timezone handling (Python 3.9+)
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None  # type: ignore
 
-# Page config
 st.set_page_config(page_title="Parlay Builder — TheOddsAPI", page_icon="🎯", layout="wide")
 
 # ---- Sidebar (minimal controls) ----
@@ -147,9 +144,32 @@ def color_for_prob(p: Optional[float]) -> str:
         return "#F1C40F"
     return "#E67E22"
 
+# --- New helper: ensure sport titles for events (fixes missing sport names) ---
+def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[str, Any]]) -> None:
+    """
+    Ensure each event in ev_list has a readable _sport_title.
+    Uses sports_list (from fetch_sports) to map keys to titles and checks common event fields.
+    """
+    smap = {s.get("key"): s.get("title") for s in (sports_list or [])}
+    for ev in ev_list:
+        # check a few likely fields that might indicate sport or league
+        candidate_keys = [
+            ev.get("_sport_key"),
+            ev.get("sport_key"),
+            ev.get("sport"),
+            ev.get("category"),
+            ev.get("league"),
+        ]
+        sport_key = next((k for k in candidate_keys if k), None)
+        if sport_key and not ev.get("_sport_title"):
+            ev["_sport_title"] = smap.get(sport_key, sport_key)
+        # fallback: if still missing, set a readable fallback so UI isn't empty
+        if not ev.get("_sport_title"):
+            ev["_sport_title"] = ev.get("_sport_title") or "Unknown"
+
 # ---- Session state defaults ----
 if "events" not in st.session_state:
-    st.session_state.events = []  # loaded events
+    st.session_state.events = []
 if "parlay" not in st.session_state:
     st.session_state.parlay = []
 if "events_page" not in st.session_state:
@@ -157,14 +177,16 @@ if "events_page" not in st.session_state:
 
 # ---- Header ----
 st.markdown("# 🎯 Parlay Builder — TheOddsAPI prototype")
-st.markdown("Use the left tab to browse events and the right column to review your parlay. Auto-pick in the Auto-pick tab.")
+st.markdown("Browse events on the left, review and manage your parlay on the right. Use the Debug tab to inspect the loaded feed.")
 
 # ---- Top controls row (Load / Sport selector) ----
 top_cols = st.columns([3, 2, 1])
 with top_cols[0]:
-    st.info("Browse events: search, filter, and add outcomes to the parlay.")
+    st.info("Events browser / Auto-pick are in the left column tabs.")
 with top_cols[1]:
+    # fetch sports list to populate sport selector and title mapping
     sport_options = []
+    sport_titles = {}
     if API_KEY:
         try:
             sports_list = fetch_sports(API_KEY)
@@ -173,23 +195,22 @@ with top_cols[1]:
         except Exception:
             sport_options = []
             sport_titles = {}
-    else:
-        sport_titles = {}
     chosen_sport_for_load = st.selectbox("Sport (for load)", options=[""] + sport_options, format_func=lambda k: sport_titles.get(k, " — choose sport — "))
 with top_cols[2]:
     if st.button("Load odds for sport(s)"):
         try:
-            loaded = []
+            loaded: List[Dict[str, Any]] = []
             if scan_all_sports:
+                # iterate sports and collect events
                 for skey, stitle in sport_titles.items():
                     try:
                         evs = fetch_odds_for_sport(API_KEY, skey, regions, markets, int(odds_ttl))
-                        for ev in evs:
-                            ev["_sport_key"] = skey
-                            ev["_sport_title"] = stitle
-                        loaded.extend(evs)
                     except Exception:
                         continue
+                    for ev in evs:
+                        ev["_sport_key"] = skey
+                        ev["_sport_title"] = stitle
+                    loaded.extend(evs)
             else:
                 if not chosen_sport_for_load:
                     st.warning("Select a sport to load, or enable Scan all sports in the sidebar.")
@@ -200,6 +221,9 @@ with top_cols[2]:
                         ev["_sport_key"] = chosen_sport_for_load
                         ev["_sport_title"] = stitle
                     loaded = evs
+
+            # ensure sport titles exist for all events (use sports_list mapping & fallbacks)
+            _ensure_sport_titles(loaded, sports_list if 'sports_list' in locals() else [])
             st.session_state.events = loaded
             st.session_state.events_page = 1
             st.success(f"Loaded {len(loaded)} events.")
@@ -217,7 +241,10 @@ with left_col:
 
         # Search & filters
         search_text = st.text_input("Search (event title, team, selection)", value="")
-        sport_filter = st.selectbox("Filter by sport", options=["All"] + sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "" for ev in st.session_state.events})))
+        sport_filter = st.selectbox(
+            "Filter by sport",
+            options=["All"] + sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "Unknown" for ev in st.session_state.events}))
+        )
         sort_by = st.selectbox("Sort by", options=["Start time", "Odds value (best uplift)", "Sport", "Title"])
 
         # Pagination controls
@@ -242,7 +269,6 @@ with left_col:
             # search
             title = ev.get("title") or " "
             teams_text = " ".join(ev.get("teams") or [])
-            # collect outcome names for search
             outcome_names = []
             for bm in ev.get("bookmakers", []):
                 for m in bm.get("markets", []):
@@ -255,7 +281,6 @@ with left_col:
 
         # sort
         def event_value(ev):
-            # compute top uplift across outcomes for quick sort
             uplifts = []
             for o in get_consensus_and_best_outcomes(ev):
                 cons = o.get("consensus") or 0
@@ -305,7 +330,6 @@ with left_col:
                                     continue
                                 row_cols = st.columns([6, 1])
                                 row_cols[0].write(f"{name}  —  {price}  (market: {mkey} | bm: {bm_key})")
-                                # stable hashed key for Add button
                                 raw_key = f"{ev_id}|{name}|{mkey}|{bm_key}"
                                 add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
                                 if row_cols[1].button("Add", key=add_key):
@@ -319,7 +343,6 @@ with left_col:
                                         "commence_time": commence,
                                         "reason": reason
                                     }
-                                    # prevent duplicates same-event+selection
                                     exists = any((leg.get("event_id") == ev_id and leg.get("selection") == name) for leg in st.session_state.parlay)
                                     if exists:
                                         st.warning("This selection is already in the parlay.")
@@ -345,7 +368,6 @@ with left_col:
         max_spread_pct = st.slider("Max spread across books (%)", min_value=0, max_value=20, value=5) / 100.0
         require_dk = st.checkbox("Require DraftKings for safety picks", value=True)
 
-        # helper to build filtered_events for auto-pick (respect DK before 11 PT if set)
         def _auto_pick_source_events():
             s_events = st.session_state.events[:]
             if filter_dk_before_11_pt and ZoneInfo is not None:
@@ -374,7 +396,6 @@ with left_col:
                 s_events = fe
             return s_events
 
-        # Auto-pick actions
         col_ap = st.columns([1, 1, 2])
         if col_ap[0].button("Preview value picks"):
             picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
@@ -455,7 +476,12 @@ with left_col:
         with st.expander("⚠️ Debug (raw events & session)", expanded=False):
             st.write("Events loaded:", len(st.session_state.events))
             if st.session_state.events:
-                st.json(st.session_state.events[0])
+                # show first event fields that matter for sport/title inspection
+                sample = st.session_state.events[0].copy()
+                keys_to_show = ["_sport_key", "_sport_title", "id", "title", "commence_time", "bookmakers"]
+                trimmed = {k: sample.get(k) for k in keys_to_show if k in sample}
+                st.json(trimmed)
+            st.write("Unique sport titles loaded:", sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "Unknown" for ev in st.session_state.events})))
             st.write("Session parlay:", len(st.session_state.parlay))
             st.json(st.session_state.parlay)
 
@@ -471,8 +497,8 @@ with right_col:
           table.picks th, table.picks td {padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px;}
         </style>
         """
-        picked_html += "<table class='picks'><thead><tr><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Reason</th><th></th></tr></thead><tbody>"
-        for i, leg in enumerate(st.session_state.parlay):
+        picked_html += "<table class='picks'><thead><tr><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Reason</th></tr></thead><tbody>"
+        for leg in st.session_state.parlay:
             prob = None
             try:
                 prob = 1.0 / float(leg.get("price", 0))
@@ -481,7 +507,6 @@ with right_col:
             color = color_for_prob(prob)
             sport = leg.get("sport") or ""
             start = leg.get("commence_time") or ""
-            # include remove button cell (we'll render a placeholder; actual Remove is below)
             picked_html += (
                 f"<tr>"
                 f"<td><span class='pill' style='background:{color}'>{sport}</span></td>"
@@ -490,11 +515,10 @@ with right_col:
                 f"<td>{start}</td>"
                 f"<td>{leg.get('price')}</td>"
                 f"<td>{leg.get('reason','')}</td>"
-                f"<td> </td>"
                 f"</tr>"
             )
         if not st.session_state.parlay:
-            picked_html += "<tr><td colspan='7'><em>No picks yet</em></td></tr>"
+            picked_html += "<tr><td colspan='6'><em>No picks yet</em></td></tr>"
         picked_html += "</tbody></table>"
         st.markdown(picked_html, unsafe_allow_html=True)
 
@@ -515,8 +539,8 @@ with right_col:
             cols[0].markdown(f"**{leg.get('sport','')}** — {leg.get('title','')}  \n> **{leg.get('selection','')}**  @ {leg.get('price')}")
             rem_key = "rem-" + hashlib.sha1(f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}".encode()).hexdigest()[:12]
             if cols[1].button("Remove", key=rem_key):
+                # remove and rely on Streamlit rerun to refresh
                 st.session_state.parlay.pop(idx)
-                st.experimental_rerun()
 
     # Parlay metrics & export
     st.markdown("---")
