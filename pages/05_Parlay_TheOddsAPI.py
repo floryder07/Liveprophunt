@@ -1,10 +1,14 @@
+```python name=pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
-- Reads THEODDS_API_KEY from env or an obscured sidebar input.
-- Lets you pick a sport (auto-fetched), load odds for that sport, filter by bookmaker,
-  add outcomes to a parlay, and compute combined decimal/american odds and payout.
-- Uses simple caching to avoid hammering the API (ttl for odds is configurable).
+Merged with an "auto-pick" feature that selects legs based on market value
+(best bookmaker price vs market consensus) and explains why each pick was chosen.
+
+Usage:
+- Provide THEODDS_API_KEY via env or paste in the sidebar.
+- Load sport odds, then use "Auto-pick by market value" to preview or add picks.
+- This is a recommendation/simulation tool only.
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -12,6 +16,7 @@ import math
 import requests
 import streamlit as st
 from datetime import datetime
+from statistics import median
 
 st.set_page_config(page_title="Parlay Builder — TheOddsAPI", page_icon="🎯", layout="wide")
 st.title("🎯 Parlay Builder — TheOddsAPI prototype")
@@ -36,7 +41,16 @@ def decimal_to_american(d: float) -> str:
         return "N/A"
     if d >= 2.0:
         return f"+{round((d - 1) * 100)}"
-    return str(round(-100 / (d - 1)))
+    try:
+        return str(round(-100 / (d - 1)))
+    except Exception:
+        return "N/A"
+
+def prod(xs: List[float]) -> float:
+    p = 1.0
+    for x in xs:
+        p *= x
+    return p
 
 @st.cache_data(ttl=300)
 def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
@@ -45,7 +59,7 @@ def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
     resp.raise_for_status()
     return resp.json()
 
-@st.cache_data(ttl=odds_ttl)
+@st.cache_data(ttl=lambda: odds_ttl)
 def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], markets_list: List[str]) -> List[Dict[str, Any]]:
     regions_q = ",".join(regions_list)
     markets_q = ",".join(markets_list)
@@ -56,7 +70,6 @@ def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], 
 
 def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str]=None) -> List[Dict[str, Any]]:
     outcomes = []
-    # TheOddsAPI shape: event['bookmakers'][...]['markets'][...]['outcomes']
     for bm in event.get("bookmakers", []):
         if bookmaker_filter and bookmaker_filter.strip():
             if bm.get("key") != bookmaker_filter and bm.get("title") != bookmaker_filter:
@@ -77,11 +90,114 @@ def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str]=None
                     })
     return outcomes
 
-def prod(xs: List[float]) -> float:
-    p = 1.0
-    for x in xs:
-        p *= x
-    return p
+# --- Auto-pick utilities (value-based heuristic) ---
+def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    For an event, return outcomes with consensus (median across all sources)
+    and best_price (max across bookmakers).
+    """
+    price_map = {}  # name -> list[float]
+    for bm in event.get("bookmakers", []):
+        for m in bm.get("markets", []):
+            for o in m.get("outcomes", []):
+                name = o.get("name") or o.get("participant") or o.get("label")
+                try:
+                    price = float(o.get("price"))
+                except Exception:
+                    continue
+                price_map.setdefault(name, []).append(price)
+
+    results = []
+    for name, prices in price_map.items():
+        if not prices:
+            continue
+        cons = median(prices)
+        best = max(prices)
+        results.append({"name": name, "consensus": cons, "best_price": best})
+    return results
+
+def score_outcome_value(consensus: float, best_price: float) -> float:
+    if consensus <= 0:
+        return 0.0
+    return (best_price / consensus) - 1.0
+
+def auto_pick_legs_by_value(events: List[Dict[str, Any]], n_legs: int = 3, min_value: float = 0.02, avoid_same_event: bool = True) -> List[Dict[str, Any]]:
+    """
+    Returns a list of picks:
+      { event_id, event_title, selection, price, consensus, value, implied_consensus, reason }
+    """
+    candidates = []
+    for ev in events:
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        outs = get_consensus_and_best_outcomes(ev)
+        for o in outs:
+            cons = o["consensus"]
+            best = o["best_price"]
+            value = score_outcome_value(cons, best)
+            implied_consensus = (1.0 / cons) if cons > 0 else None
+            implied_best = (1.0 / best) if best > 0 else None
+            favorite_flag = cons < 2.0 if cons else False
+            candidates.append({
+                "event_id": ev_id,
+                "event_title": title,
+                "selection": o["name"],
+                "price": best,
+                "consensus": cons,
+                "value": value,
+                "implied_consensus": implied_consensus,
+                "implied_best": implied_best,
+                "favorite": favorite_flag
+            })
+
+    # sort by value desc, then by best price desc
+    candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
+
+    selected = []
+    used_events = set()
+    for c in candidates:
+        if len(selected) >= n_legs:
+            break
+        if c["value"] < min_value:
+            continue
+        if avoid_same_event and c["event_id"] in used_events:
+            continue
+        reason_parts = []
+        reason_parts.append(f"Best price {c['price']:.2f} vs consensus {c['consensus']:.2f} ({c['value']*100:.1f}% uplift)")
+        if c["favorite"]:
+            reason_parts.append("Market consensus marks this as a favorite.")
+        else:
+            reason_parts.append("Market consensus marks this as an underdog.")
+        if c["implied_best"] and c["implied_consensus"]:
+            reason_parts.append(f"Implied best prob {c['implied_best']*100:.1f}% vs consensus {c['implied_consensus']*100:.1f}%")
+        reason = " — ".join(reason_parts)
+        selected.append({
+            "event_id": c["event_id"],
+            "event_title": c["event_title"],
+            "selection": c["selection"],
+            "price": c["price"],
+            "consensus": c["consensus"],
+            "value": c["value"],
+            "implied_consensus": c["implied_consensus"],
+            "reason": reason
+        })
+        used_events.add(c["event_id"])
+    return selected
+
+def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
+    """
+    Conservative Kelly fraction suggestion using implied prob p as model.
+    Returns fraction of bankroll to stake.
+    """
+    b = decimal_odds - 1.0
+    if b <= 0 or p <= 0:
+        return 0.0
+    numerator = (p * (b + 1) - 1.0)
+    denom = b
+    if denom == 0:
+        return 0.0
+    raw = numerator / denom
+    return max(0.0, f * raw)
 
 # ---- UI: sports selector ----
 sports = []
@@ -91,8 +207,6 @@ if API_KEY:
     except Exception as e:
         st.sidebar.error(f"Could not fetch sports list: {e}")
 
-if not sports:
-    st.sidebar.info("No sports loaded (or API key missing). You can still use the sample events below.")
 sport_options = {s.get("key"): s.get("title") for s in sports}
 selected_sport = st.sidebar.selectbox("Sport (select)", options=[""] + list(sport_options.keys()), format_func=lambda k: sport_options.get(k, " — choose sport — "))
 
@@ -132,7 +246,6 @@ if "parlay" not in st.session_state:
     st.session_state.parlay = []
 
 def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float):
-    # prevent duplicate event
     for leg in st.session_state.parlay:
         if leg["event_id"] == ev_id:
             st.warning("You already added a leg from this event. Remove it first to add another selection.")
@@ -166,9 +279,35 @@ with left:
 
 with right:
     st.header("Parlay builder")
+
+    # --- Auto-pick controls ---
+    st.subheader("Auto-pick by market value")
+    auto_n = st.number_input("Number of legs to pick", min_value=1, max_value=10, value=3)
+    auto_min_pct = st.slider("Minimum uplift vs consensus (%)", min_value=0, max_value=50, value=2)
+    auto_min_value = auto_min_pct / 100.0
+    avoid_same_event = st.checkbox("Avoid >1 leg per event", value=True)
+    preview_only = st.checkbox("Preview only (don't auto-add)", value=True)
+    if st.button("Auto-pick by market value"):
+        picks = auto_pick_legs_by_value(events, n_legs=auto_n, min_value=auto_min_value, avoid_same_event=avoid_same_event)
+        if not picks:
+            st.warning("No picks met the criteria.")
+        else:
+            st.success(f"Found {len(picks)} pick(s). {'Previewing — not added.' if preview_only else 'Added to parlay.'}")
+            for p in picks:
+                with st.expander(f"{p['event_title']} — {p['selection']} @ {p['price']}"):
+                    st.write("Reason:", p["reason"])
+                    st.write(f"Consensus: {p['consensus']:.2f} | Value uplift: {p['value']*100:.2f}%")
+                    # show a conservative Kelly suggestion using implied consensus as model p (if available)
+                    if p.get("implied_consensus"):
+                        kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
+                        st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
+                    if not preview_only:
+                        add_leg(p['event_id'], p['event_title'], p['selection'], p['price'])
+
+    # ---- Current parlay UI ----
     legs = st.session_state.parlay
     if not legs:
-        st.info("Add legs from the left column.")
+        st.info("Add legs from the left column or use Auto-pick.")
     else:
         for idx, leg in enumerate(legs):
             c = st.columns([3, 1])
@@ -193,4 +332,5 @@ with right:
             if st.button("Simulate parlay"):
                 st.success(f"Simulated: stake ${stake:.2f} → payout ${payout:,.2f} (profit ${profit:,.2f})")
 
-st.caption("Prototype uses TheOddsAPI. This is a simulation tool — not connected to any bookmaker placement API.")
+st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
+```
