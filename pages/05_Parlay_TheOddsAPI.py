@@ -1,12 +1,9 @@
-```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/main/pages/05_Parlay_TheOddsAPI.py
-"""
-Parlay Builder — TheOddsAPI prototype (safe-only, DraftKings removed)
-
-This simplified version removes DraftKings search links and related HTML.
-Focus is on loading events, auto-pick (value + safest) and parlay management.
-Includes robustness fixes (safe price parsing, skip events without stable id,
-stable remove keys, immediate JSON download).
-"""
+# Parlay Builder — TheOddsAPI prototype (safe-only, DraftKings removed)
+#
+# This simplified version removes DraftKings search links and related HTML.
+# Focus is on loading events, auto-pick (value + safest) and parlay management.
+# Includes robustness fixes (safe price parsing, skip events without stable id,
+# stable remove keys, immediate JSON download).
 from typing import Any, Dict, List, Optional
 import os
 import hashlib
@@ -37,7 +34,7 @@ odds_ttl = st.sidebar.number_input("Odds cache key (change to bust cache)", min_
 
 st.sidebar.markdown("---")
 scan_all_sports = st.sidebar.checkbox("Scan all sports for picks (may be slow / rate-limited)", value=False)
-filter_dk_before_11_pt = st.sidebar.checkbox("Auto-filter by bookmaker before 11:00 PT", value=False)
+filter_bm_before_11_pt = st.sidebar.checkbox("Auto-filter by bookmaker before 11:00 PT", value=False)
 st.sidebar.markdown("---")
 if not API_KEY:
     st.sidebar.warning("No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here.")
@@ -369,7 +366,7 @@ with left_col:
                                 raw_key = f"{ev_id}|{name}|{mkey}|{bm_key}"
                                 add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
                                 if row_cols[1].button("Add", key=add_key):
-                                    reason = get_consensus_and_best_outcomes(ev) and (get_consensus_and_best_outcomes(ev)[0].get("consensus") is not None) and "manual add" or "manual add"
+                                    reason = "manual add"
                                     add_leg = {"event_id": ev_id, "sport": sport_title, "title": title, "selection": name, "price": price, "commence_time": commence, "reason": reason}
                                     exists = any((leg.get("event_id") == ev_id and leg.get("selection") == name) for leg in st.session_state.parlay)
                                     if exists:
@@ -394,7 +391,7 @@ with left_col:
 
         def _auto_pick_source_events():
             s_events = st.session_state.events[:]
-            if filter_dk_before_11_pt and ZoneInfo is not None:
+            if filter_bm_before_11_pt and ZoneInfo is not None:
                 tz = ZoneInfo("America/Los_Angeles")
                 now = datetime.now(tz)
                 cutoff = datetime.combine(now.date(), time(hour=11, minute=0), tzinfo=tz)
@@ -547,4 +544,3 @@ with right_col:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
-```
