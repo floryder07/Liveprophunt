@@ -1,4 +1,3 @@
-```python name=parlay_builder.py
 # Parlay Builder — TheOddsAPI prototype (safe-only, show top safe candidates)
 #
 # Copy this file content exactly (do NOT include the surrounding triple-backtick lines)
@@ -546,4 +545,3 @@ with right_col:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
-```
