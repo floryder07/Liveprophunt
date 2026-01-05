@@ -673,4 +673,3 @@ st.caption(
     "- Top players are ranked by a 'consistency score'. If nba_api is installed the page will compute a hit-rate from recent games (recommended). Otherwise a live-snapshot heuristic is used.\n"
     "- To use live sportsbook props install a TheOddsAPI key and select 'TheOddsAPI (live props)' as data source in the sidebar.\n"
     "- If you want more accurate modeling I can tweak the scoring (e.g., weight recent games, home/away adjustments, minutes played filters, or combine implied probability from moneylines).\n"
-)
