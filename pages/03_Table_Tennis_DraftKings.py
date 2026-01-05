@@ -7,7 +7,7 @@ Usage:
 - Or choose "Custom JSON URL" and paste a full endpoint URL that returns events JSON that includes bookmakers with id/name 'draftkings'.
 
 Dependencies:
-pip install requests streamlit-autorefresh  # streamlit-autorefresh is optional
+pip install requests streamlit-autorefresh pandas
 
 Notes:
 - This page filters the returned bookmakers for DraftKings only.
@@ -15,16 +15,15 @@ Notes:
 """
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+import logging
+import os
 
 # Ensure repo root is on sys.path so 'app' package can be imported from pages/
 repo_root = Path(__file__).resolve().parent.parent
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
-
-import time
-from datetime import datetime, timezone
-import logging
-from typing import Any, Dict, List, Optional
 
 import streamlit as st
 import requests
@@ -56,7 +55,9 @@ markets = "h2h"  # head-to-head / match odds
 odds_format = "decimal"  # decimal/american etc.
 
 if provider == "TheOddsAPI (template)":
-    api_key = st.sidebar.text_input("API key for TheOddsAPI (or leave empty for instructions)", value="", type="password")
+    api_key = st.sidebar.text_input("API key for TheOddsAPI (or leave empty to use THEODDS_API_KEY env var)", value="", type="password")
+    if not api_key:
+        api_key = os.environ.get("THEODDS_API_KEY", "")
     sport_key = st.sidebar.text_input("Sport key (provider-specific)", value="table_tennis")
     regions = st.sidebar.text_input("Regions (comma-separated)", value="us")
     markets = st.sidebar.text_input("Markets (comma-separated)", value="h2h")
@@ -205,12 +206,13 @@ def fetch_and_filter_draftkings(only_inplay_flag: bool = True) -> List[Dict[str,
                 continue
             start = get_event_start_time(ev)
             # prepare a normalized record
+            teams = ev.get("teams") or ev.get("runners") or ev.get("competitors") or []
+            teams_norm = [t if isinstance(t, str) else (t.get("name") if isinstance(t, dict) else str(t)) for t in teams]
             rec = {
                 "commence_time": start.isoformat() if start else None,
-                "home_away": ev.get("home_team") or ev.get("home") or "",
-                "teams": ev.get("teams") or ev.get("runners") or ev.get("competitors") or [],
+                "teams": teams_norm,
                 "sport": ev.get("sport_key") or ev.get("sport") or None,
-                "title": ev.get("title") or ev.get("name") or " / ".join(ev.get("teams") or []),
+                "title": ev.get("title") or ev.get("name") or " / ".join(teams_norm),
                 "inplay": inplay,
                 "bookmaker": bk,
                 "odds_lines": format_odds_from_bookmaker(bk),
@@ -283,9 +285,9 @@ else:
             for line in ev.get("odds_lines", []):
                 st.write(line)
             # If you want to show split outcomes in columns:
-            outcomes = ev["bookmaker"].get("markets", [])
-            if outcomes:
-                for m in outcomes:
+            outcomes_markets = ev["bookmaker"].get("markets", [])
+            if outcomes_markets:
+                for m in outcomes_markets:
                     st.markdown(f"**Market: {m.get('key') or m.get('market_key') or m.get('key','')}**")
                     cols = st.columns(len(m.get("outcomes", []) or []))
                     for i, oc in enumerate(m.get("outcomes", []) or []):
