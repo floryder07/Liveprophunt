@@ -1,4 +1,4 @@
-```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/87d1805ef94734d595c507e2835df65292d028bc/pages/05_Parlay_TheOddsAPI.py
+```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/main/pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (debug-friendly)
 
@@ -618,8 +618,10 @@ with left_col:
                     st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | uplift {uplift_pct:.2f}% | implied {implied:.3f}")
             else:
                 for p in picks:
-                    st.markdown(f"**{p.get('sport_title') or p.get('sport_key') or ''}** — {p['event_title']}  \n"
-                                f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}")
+                    st.markdown(
+                        f"**{p.get('sport_title') or p.get('sport_key') or ''}** — {p['event_title']}\n"
+                        f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}"
+                    )
         # Add value picks
         if col_ap[1].button("Add value picks"):
             picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
@@ -674,8 +676,10 @@ with left_col:
                     st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | implied {implied:.3f} | spread {spread:.3f}")
             else:
                 for p in picks:
-                    st.markdown(f"**{p.get('sport_title') or ''}** — {p['event_title']}  \n"
-                                f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}")
+                    st.markdown(
+                        f"**{p.get('sport_title') or ''}** — {p['event_title']}\n"
+                        f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}"
+                    )
         # Add safest picks
         if st.button("Add safest picks"):
             picks = auto_pick_safest_legs(
