@@ -9,7 +9,7 @@ requests + BeautifulSoup and is intended for personal/testing use.
 
 Usage:
   - Edit LISTING_URL and CSS SELECTORS to match the target page structure.
-  - Run: python3 scraper_template.py
+  - Run: python3 scripts/scraper_template.py
   - The script writes output to `output/matches.json`.
 
 Notes:
@@ -31,10 +31,6 @@ OUTPUT_DIR = "output"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "matches.json")
 
 # CSS selectors for a listing page. These are placeholders and must be adapted.
-# Example:
-#   - MATCH_WRAPPER_SEL should select each match element on the listing page
-#   - TEAM_A_SEL and TEAM_B_SEL should select the team/player names within a match element
-#   - SCORE_A_SEL and SCORE_B_SEL are the score elements if present
 MATCH_WRAPPER_SEL = ".match-item"       # placeholder
 TEAM_A_SEL = ".team-a .name"           # placeholder
 TEAM_B_SEL = ".team-b .name"           # placeholder
@@ -46,13 +42,12 @@ INPLAY_FLAG_SEL = ".inplay"            # placeholder (presence indicates in-play
 # Rate limiting
 REQUEST_DELAY_SECONDS = 1.0
 
-# HTTP headers (polite default; do not pretend to be a browser unless you have to and it's allowed)
+# HTTP headers (polite default)
 HEADERS = {
     "User-Agent": "TableTennisLiveBot/1.0 (+https://yourdomain.example) Python requests"
 }
 
 
-# === Scraping / parsing functions ===
 def fetch_page(url: str, headers: Optional[Dict[str, str]] = None) -> str:
     resp = requests.get(url, headers=headers or HEADERS, timeout=15)
     resp.raise_for_status()
@@ -64,27 +59,20 @@ def parse_listing_html(html: str) -> List[Dict]:
     matches = []
     for idx, m in enumerate(soup.select(MATCH_WRAPPER_SEL)):
         try:
-            # Team / player names
             team_a = m.select_one(TEAM_A_SEL).get_text(strip=True) if m.select_one(TEAM_A_SEL) else ""
             team_b = m.select_one(TEAM_B_SEL).get_text(strip=True) if m.select_one(TEAM_B_SEL) else ""
-            # Scores (optional)
             score_a = m.select_one(SCORE_A_SEL).get_text(strip=True) if m.select_one(SCORE_A_SEL) else None
             score_b = m.select_one(SCORE_B_SEL).get_text(strip=True) if m.select_one(SCORE_B_SEL) else None
-            # Start time (try to parse, else keep raw)
             start_raw = m.select_one(START_TIME_SEL).get_text(strip=True) if m.select_one(START_TIME_SEL) else None
             start_iso = None
             if start_raw:
                 try:
-                    # Attempt to parse common formats, adapt as necessary
                     start_dt = datetime.fromisoformat(start_raw)
                     start_iso = start_dt.isoformat()
                 except Exception:
-                    # keep raw string if parsing fails
                     start_iso = start_raw
-            # In-play flag
             inplay = bool(m.select_one(INPLAY_FLAG_SEL))
 
-            # normalize into a minimal record
             rec = {
                 "id": f"scraped-{idx}",
                 "title": f"{team_a} vs {team_b}",
@@ -92,7 +80,6 @@ def parse_listing_html(html: str) -> List[Dict]:
                 "score": {"a": score_a, "b": score_b} if (score_a or score_b) else None,
                 "start": start_iso,
                 "inplay": inplay,
-                # additional metadata you can fill in:
                 "source_url": LISTING_URL,
                 "scraped_at": datetime.utcnow().isoformat() + "Z",
             }
