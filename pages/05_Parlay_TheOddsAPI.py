@@ -1,4 +1,3 @@
-```python name=pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
@@ -29,7 +28,7 @@ API_KEY = api_key_input.strip() or os.environ.get("THEODDS_API_KEY", "")
 regions = st.sidebar.multiselect("Regions (comma-select)", options=["us", "uk", "eu", "au"], default=["us"])
 markets = st.sidebar.multiselect("Markets", options=["h2h", "spreads", "totals"], default=["h2h"])
 bookmaker_filter = st.sidebar.text_input("Preferred bookmaker key/title (optional)", value="")
-odds_ttl = st.sidebar.number_input("Odds cache TTL (seconds)", min_value=5, value=20, step=5)
+odds_ttl = st.sidebar.number_input("Odds cache key (change to bust cache)", min_value=1, value=20, step=1)
 refresh = st.sidebar.button("Reload sports list / clear cache")
 
 if not API_KEY:
@@ -59,8 +58,9 @@ def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
     resp.raise_for_status()
     return resp.json()
 
-@st.cache_data(ttl=lambda: odds_ttl)
-def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], markets_list: List[str]) -> List[Dict[str, Any]]:
+# Note: include odds_ttl as a parameter so changing it busts the cache.
+@st.cache_data()
+def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], markets_list: List[str], cache_bust: int) -> List[Dict[str, Any]]:
     regions_q = ",".join(regions_list)
     markets_q = ",".join(markets_list)
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?regions={regions_q}&markets={markets_q}&oddsFormat=decimal&apiKey={api_key}"
@@ -121,7 +121,7 @@ def score_outcome_value(consensus: float, best_price: float) -> float:
         return 0.0
     return (best_price / consensus) - 1.0
 
-def auto_pick_legs_by_value(events: List[Dict[str, Any]], n_legs: int = 3, min_value: float = 0.02, avoid_same_event: bool = True) -> List[Dict[str, Any]]:
+def auto_pick_legs_by_value(events: List[Dict,], n_legs: int = 3, min_value: float = 0.02, avoid_same_event: bool = True) -> List[Dict[str, Any]]:
     """
     Returns a list of picks:
       { event_id, event_title, selection, price, consensus, value, implied_consensus, reason }
@@ -200,7 +200,7 @@ def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
     return max(0.0, f * raw)
 
 # ---- UI: sports selector ----
-sports = []
+sports: List[Dict[str, Any]] = []
 if API_KEY:
     try:
         sports = fetch_sports(API_KEY)
@@ -216,7 +216,8 @@ events: List[Dict[str, Any]] = []
 
 if selected_sport:
     try:
-        events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets)
+        # include odds_ttl as cache-busting argument
+        events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
     except Exception as e:
         st.sidebar.error(f"Could not load odds: {e}")
         events = []
@@ -297,7 +298,6 @@ with right:
                 with st.expander(f"{p['event_title']} — {p['selection']} @ {p['price']}"):
                     st.write("Reason:", p["reason"])
                     st.write(f"Consensus: {p['consensus']:.2f} | Value uplift: {p['value']*100:.2f}%")
-                    # show a conservative Kelly suggestion using implied consensus as model p (if available)
                     if p.get("implied_consensus"):
                         kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
                         st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
@@ -333,4 +333,3 @@ with right:
                 st.success(f"Simulated: stake ${stake:.2f} → payout ${payout:,.2f} (profit ${profit:,.2f})")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
-```
