@@ -1,8 +1,8 @@
-# Parlay Builder — TheOddsAPI (overwrite with this file)
+# Parlay Builder — TheOddsAPI (auto-load + debug helpers)
 #
-# The complete page: safe-picks, "Preview/Add safest picks", "Show top safe candidates",
-# display toggles for teams/players, best bookmaker, and event id.
-# Paste this entire file content into pages/05_Parlay_TheOddsAPI.py (overwrite).
+# Overwrites pages/05_Parlay_TheOddsAPI.py with an auto-load-on-start option,
+# better error messages, and small debug buttons to inspect fetched data.
+# Paste this entire file into pages/05_Parlay_TheOddsAPI.py (overwrite).
 import os
 import hashlib
 import json
@@ -186,10 +186,30 @@ if "events" not in st.session_state:
     st.session_state.events = []
 if "parlay" not in st.session_state:
     st.session_state.parlay = []
+if "auto_loaded" not in st.session_state:
+    st.session_state.auto_loaded = False
+if "last_load_info" not in st.session_state:
+    st.session_state.last_load_info = ""
 
 # ---- UI ----
 st.title("Parlay Builder — TheOddsAPI")
 st.write("Preview and add conservative (safe) picks. Shows teams/players and the best bookmaker where available.")
+
+# Quick debug panel when no events loaded
+if not st.session_state.events:
+    with st.expander("Quick debug & API tests", expanded=True):
+        st.write("No events currently loaded." if not st.session_state.events else f"Loaded {len(st.session_state.events)} events.")
+        if API_KEY:
+            if st.button("Test fetch sports"):
+                try:
+                    s = fetch_sports(API_KEY)
+                    st.success(f"Fetched {len(s)} sports (sample: {s[:5]})")
+                except Exception as e:
+                    st.error(f"fetch_sports failed: {e}")
+            if st.button("Show last load info"):
+                st.write(st.session_state.last_load_info or "No load attempts yet.")
+        else:
+            st.write("Set API key in the sidebar or ensure THEODDS_API_KEY env var is set.")
 
 # Top controls (load)
 col1, col2, col3 = st.columns([3, 2, 1])
@@ -239,9 +259,44 @@ with col3:
                         loaded = evs
                 _ensure_sport_titles(loaded, sports_list if sports_list else (fetch_sports(API_KEY) if API_KEY else []))
                 st.session_state.events = loaded
+                st.session_state.last_load_info = f"Loaded {len(loaded)} events at {datetime.utcnow().isoformat()}Z"
+                st.session_state.auto_loaded = True
                 st.success(f"Loaded {len(loaded)} events.")
             except Exception as e:
+                st.session_state.last_load_info = f"Load failed: {e}"
                 st.error(f"Could not load events: {e}")
+
+# Auto-load helper: if API key present and user enabled scan_all_sports or chose a sport, load once automatically
+if API_KEY and not st.session_state.auto_loaded and (scan_all_sports or (chosen_sport and chosen_sport != "")):
+    try:
+        loaded_auto: List[Dict[str, Any]] = []
+        if scan_all_sports:
+            sports = fetch_sports(API_KEY)
+            for s in sports:
+                skey = s.get("key")
+                stitle = s.get("title")
+                try:
+                    evs = fetch_odds_for_sport(API_KEY, skey, regions, markets, int(odds_ttl))
+                except Exception:
+                    continue
+                for ev in evs:
+                    ev["_sport_key"] = skey
+                    ev["_sport_title"] = stitle
+                loaded_auto.extend(evs)
+        else:
+            evs = fetch_odds_for_sport(API_KEY, chosen_sport, regions, markets, int(odds_ttl))
+            for ev in evs:
+                ev["_sport_key"] = chosen_sport
+                ev["_sport_title"] = sport_titles.get(chosen_sport, chosen_sport)
+            loaded_auto = evs
+        _ensure_sport_titles(loaded_auto, sports_list if sports_list else (fetch_sports(API_KEY) if API_KEY else []))
+        st.session_state.events = loaded_auto
+        st.session_state.last_load_info = f"Auto-loaded {len(loaded_auto)} events at {datetime.utcnow().isoformat()}Z"
+        st.session_state.auto_loaded = True
+        st.success(f"Auto-loaded {len(loaded_auto)} events.")
+    except Exception as e:
+        st.session_state.last_load_info = f"Auto-load failed: {e}"
+        st.error(f"Auto-load failed: {e}")
 
 # Layout: left auto-pick / right parlay
 left_col, right_col = st.columns([2.5, 1])
