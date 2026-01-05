@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Parlay Generator</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#7c3aed;--muted:#9aa4b2;--text:#e6eef6}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;background:linear-gradient(180deg,#071126 0%,#071626 60%);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:28px}
+    .container{width:100%;max-width:980px}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.04);padding:22px;border-radius:12px;box-shadow:0 10px 30px rgba(2,6,23,0.6)}
+    h1{margin:0 0 10px 0;font-size:20px}
+    p.lead{margin:0 0 18px 0;color:var(--muted)}
+    form{display:flex;gap:12px;flex-wrap:wrap;align-items:end}
+    .field{display:flex;flex-direction:column;min-width:160px}
+    label{font-size:13px;color:var(--muted);margin-bottom:6px}
+    input[type="number"], select{padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:var(--text);outline:none}
+    input[type="checkbox"]{width:18px;height:18px}
+    button{background:var(--accent);color:white;padding:10px 14px;border-radius:8px;border:0;cursor:pointer;box-shadow:0 6px 18px rgba(124,58,237,0.18)}
+    .result{margin-top:18px;background:#041226;padding:14px;border-radius:10px;border:1px solid rgba(255,255,255,0.03);min-height:120px;overflow:auto}
+    .leg{border-bottom:1px dashed rgba(255,255,255,0.03);padding:10px 0}
+    .leg:last-child{border-bottom:0}
+    .meta{font-size:13px;color:var(--muted);margin-bottom:10px}
+    .error{color:#ff6b6b}
+    .small{font-size:13px;color:var(--muted)}
+    pre.json{background:#021024;padding:12px;border-radius:8px;color:#9ee0ff;white-space:pre-wrap;overflow:auto}
+    @media (max-width:640px){form{flex-direction:column} .field{width:100%}}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Parlay Generator</h1>
+      <p class="lead">Generate an NBA parlay. Works locally (mock) or with a backend at <code>/api/parlay</code>.</p>
+
+      <form id="parlayForm">
+        <div class="field">
+          <label for="legs">Legs (1–6)</label>
+          <input id="legs" type="number" min="1" max="6" value="3" />
+        </div>
+
+        <div class="field">
+          <label for="stake">Stake ($)</label>
+          <input id="stake" type="number" min="1" value="10" />
+        </div>
+
+        <div class="field" style="min-width:120px">
+          <label for="allow_same_game">Allow same-game</label>
+          <input id="allow_same_game" type="checkbox" />
+        </div>
+
+        <div style="flex:1;display:flex;justify-content:flex-end;align-items:flex-end">
+          <button type="submit">Generate</button>
+        </div>
+      </form>
+
+      <div id="result" class="result">
+        <div class="meta small">No parlay generated yet. Click Generate to see a result.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const money = v => "$" + Number(v).toFixed(2);
+
+    function mockGenerateParlay({ legsCount = 3, stake = 10 }) {
+      const teams = ["LAL vs BOS", "GSW vs PHX", "MIL vs BOS", "BKN vs MIA", "UTA vs DEN", "DAL vs SAS"];
+      const markets = ["Spread", "Moneyline", "Total"];
+      const rng = (seed) => {
+        let x = Math.sin(seed) * 10000;
+        return x - Math.floor(x);
+      };
+
+      const legs = Array.from({ length: legsCount }, (_, i) => {
+        const seed = Date.now() + i * 7;
+        const t = teams[(i + 1) % teams.length];
+        const m = markets[i % markets.length];
+        const oddsDec = 1.5 + ((rng(seed) * 1.8));
+        const oddsAm = Math.round((oddsDec - 1) * 100) >= 100 ? "+" + Math.round((oddsDec - 1) * 100) : "-" + Math.round(100 / (oddsDec - 1));
+        return {
+          fixture: t,
+          market: m,
+          selection: ["Home", "Away", "Over", "Under"][i % 4],
+          oddsDecimal: Number(oddsDec.toFixed(2)),
+          oddsAmerican: oddsAm,
+          score: Number((rng(seed) * 10).toFixed(2)),
+          diagnostics: ["mock data", "no provider"]
+        };
+      });
+
+      const combinedDecimalOdds = legs.reduce((acc, l) => acc * l.oddsDecimal, 1);
+      const payoutForStake = (s) => Number((s * combinedDecimalOdds).toFixed(2));
+      return { legs, combinedDecimalOdds, payoutForStake: payoutForStake, createdAt: new Date().toISOString() };
+    }
+
+    async function requestParlay({ legs, stake, allowSameGame }) {
+      try {
+        const res = await fetch("/api/parlay", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ legs, stake, allowSameGame })
+        });
+        if (!res.ok) throw new Error("API returned " + res.status);
+        const json = await res.json();
+        if (json && json.success && json.parlay) return json.parlay;
+        if (json && json.legs) return json;
+        throw new Error("Unexpected API response");
+      } catch (err) {
+        console.warn("API call failed, falling back to mock:", err);
+        return mockGenerateParlay({ legsCount: legs, stake });
+      }
+    }
+
+    function renderParlay(parlay, stake) {
+      const container = document.getElementById("result");
+      container.innerHTML = "";
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = `Created: ${new Date(parlay.createdAt || Date.now()).toLocaleString()} — Combined odds: x${(parlay.combinedDecimalOdds || 1).toFixed(2)} — Payout for ${money(stake)}: ${money((parlay.payoutForStake ? parlay.payoutForStake(stake) : (stake * (parlay.combinedDecimalOdds || 1))))}`;
+      container.appendChild(meta);
+
+      (parlay.legs || []).forEach((l, i) => {
+        const row = document.createElement("div");
+        row.className = "leg";
+        row.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <strong>${i+1}. ${escapeHtml(l.fixture || l.fixture)}</strong>
+              <div class="small">${escapeHtml(l.market)} — ${escapeHtml(l.selection)}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:600">${l.oddsAmerican || ""} (${(l.oddsDecimal||0).toFixed(2)})</div>
+              <div class="small">Score: ${(l.score||0).toFixed(2)}</div>
+            </div>
+          </div>
+          <div class="small" style="margin-top:8px;color:var(--muted)">Diagnostics: ${(l.diagnostics||[]).join("; ")}</div>
+        `;
+        container.appendChild(row);
+      });
+
+      const raw = document.createElement("pre");
+      raw.className = "json";
+      raw.textContent = JSON.stringify(parlay, null, 2);
+      raw.style.marginTop = "12px";
+      container.appendChild(raw);
+    }
+
+    function escapeHtml(s){ if(!s) return ""; return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    document.getElementById("parlayForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const legs = Math.min(6, Math.max(1, Number(document.getElementById("legs").value || 3)));
+      const stake = Math.max(1, Number(document.getElementById("stake").value || 10));
+      const allow_same_game = document.getElementById("allow_same_game").checked;
+
+      const resultEl = document.getElementById("result");
+      resultEl.innerHTML = "<div class='small'>Generating parlay…</div>";
+
+      try {
+        const parlay = await requestParlay({ legs, stake, allowSameGame: allow_same_game });
+        renderParlay(parlay, stake);
+      } catch (err) {
+        resultEl.innerHTML = `<div class="error">Error generating parlay: ${String(err)}</div>`;
+      }
+    });
+  </script>
+</body>
+</html>
