@@ -1,11 +1,14 @@
 """
-Parlay Builder — TheOddsAPI prototype (Streamlit)
+Parlay Builder — TheOddsAPI prototype
 
-This file:
-- Ensures _sport_title exists for each event (maps from sports list and fallback keys)
-- Has improved layout with Events / Auto-pick / Debug tabs
-- Shows a Debug panel so you can confirm the feed and sport titles
-- Avoids experimental_rerun calls
+Merged / fixed file:
+- All helper functions defined before UI (no NameError).
+- auto_pick_legs_by_value and auto_pick_safest_legs included.
+- Ensures _sport_title is set for every loaded event.
+- Improved layout (Events / Auto-pick / Debug tabs) and persistent Parlay summary.
+- Debug panel included to inspect loaded events and sport titles.
+- No use of st.experimental_rerun (removed).
+- Stable widget keys for Add/Remove buttons.
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -127,6 +130,24 @@ def get_reason_for_selection(event: Dict[str, Any], selection_name: str) -> str:
                 return reason
     return "No reason available"
 
+def get_outcome_safety_metrics(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metrics: List[Dict[str, Any]] = []
+    for o in get_consensus_and_best_outcomes(event):
+        cons = o["consensus"]
+        best = o["best_price"]
+        worst = o["worst_price"]
+        spread_pct = abs(worst - best) / cons if cons else 0.0
+        implied_consensus = (1.0 / cons) if cons > 0 else None
+        metrics.append({
+            "name": o["name"],
+            "consensus": cons,
+            "best": best,
+            "worst": worst,
+            "spread_pct": spread_pct,
+            "implied_consensus": implied_consensus,
+        })
+    return metrics
+
 def has_draftkings(bookmakers: Optional[List[Dict[str, Any]]]) -> bool:
     for bm in bookmakers or []:
         key = (bm.get("key") or "").lower()
@@ -144,6 +165,166 @@ def color_for_prob(p: Optional[float]) -> str:
         return "#F1C40F"
     return "#E67E22"
 
+# --- Auto-pick functions (both must exist before UI) ---
+def auto_pick_legs_by_value(
+    events: List[Dict[str, Any]],
+    n_legs: int = 3,
+    min_value: float = 0.02,
+    avoid_same_event: bool = True,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for ev in events:
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        # compute consensus and best prices for outcomes
+        price_map: Dict[str, List[float]] = {}
+        for bm in ev.get("bookmakers", []):
+            for m in bm.get("markets", []):
+                for o in m.get("outcomes", []):
+                    name = _safe_name(o)
+                    try:
+                        price = float(o.get("price"))
+                    except Exception:
+                        continue
+                    price_map.setdefault(name, []).append(price)
+
+        for name, prices in price_map.items():
+            if not prices:
+                continue
+            cons = median(prices)
+            best = max(prices)
+            value = (best / cons - 1.0) if cons else 0.0
+            implied_consensus = (1.0 / cons) if cons > 0 else None
+            favorite_flag = cons < 2.0 if cons else False
+            candidates.append({
+                "event_id": ev_id,
+                "event_title": title,
+                "selection": name,
+                "price": best,
+                "consensus": cons,
+                "value": value,
+                "implied_consensus": implied_consensus,
+                "favorite": favorite_flag,
+                "sport_key": ev.get("_sport_key"),
+                "sport_title": ev.get("_sport_title"),
+                "commence_time": ev.get("commence_time") or ev.get("start"),
+            })
+
+    # sort by value desc then price desc
+    candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    used_events = set()
+    for c in candidates:
+        if len(selected) >= n_legs:
+            break
+        if c["value"] < min_value:
+            continue
+        if avoid_same_event and c["event_id"] in used_events:
+            continue
+        reason_parts = []
+        reason_parts.append(f"Best price {c['price']:.2f} vs consensus {c['consensus']:.2f} ({c['value']*100:.1f}% uplift)")
+        reason_parts.append("Favorite" if c["favorite"] else "Underdog")
+        if c["implied_consensus"]:
+            reason_parts.append(f"Implied {c['implied_consensus']*100:.1f}%")
+        reason = " — ".join(reason_parts)
+        selected.append({
+            "event_id": c["event_id"],
+            "sport_key": c.get("sport_key"),
+            "sport_title": c.get("sport_title"),
+            "event_title": c["event_title"],
+            "selection": c["selection"],
+            "price": c["price"],
+            "consensus": c["consensus"],
+            "value": c["value"],
+            "implied_consensus": c["implied_consensus"],
+            "reason": reason,
+            "commence_time": c.get("commence_time"),
+        })
+        used_events.add(c["event_id"])
+    return selected
+
+def auto_pick_safest_legs(
+    events: List[Dict[str, Any]],
+    n_legs: int = 3,
+    max_decimal_odds: float = 1.8,
+    min_consensus_prob: float = 0.6,
+    max_spread_pct: float = 0.05,
+    require_bookmaker: Optional[str] = "draftkings",
+    avoid_same_event: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Conservative picks: prefer outcomes with high consensus (implied prob),
+    low inter-book spread, and odds <= max_decimal_odds.
+    """
+    candidates: List[Dict[str, Any]] = []
+    for ev in events:
+        if require_bookmaker:
+            found = False
+            for bm in ev.get("bookmakers", []):
+                if (bm.get("key") or "").lower() == require_bookmaker.lower() or (bm.get("title") or "").lower().find(require_bookmaker.lower()) != -1:
+                    found = True
+                    break
+            if not found:
+                continue
+
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        metrics = get_outcome_safety_metrics(ev)
+        for m in metrics:
+            cons = m.get("consensus", 0)
+            implied = m.get("implied_consensus") or 0.0
+            best = m.get("best") or 0.0
+            spread = m.get("spread_pct") or 0.0
+            if best > max_decimal_odds:
+                continue
+            if implied < min_consensus_prob:
+                continue
+            if spread > max_spread_pct:
+                continue
+            safety_score = implied - (spread * 0.5)
+            candidates.append({
+                "event_id": ev_id,
+                "event_title": title,
+                "selection": m["name"],
+                "price": best,
+                "consensus": cons,
+                "implied_consensus": implied,
+                "spread_pct": spread,
+                "safety_score": safety_score,
+                "sport_key": ev.get("_sport_key"),
+                "sport_title": ev.get("_sport_title"),
+                "commence_time": ev.get("commence_time") or ev.get("start"),
+            })
+
+    # sort by safety_score then implied_consensus
+    candidates.sort(key=lambda c: (c["safety_score"], c["implied_consensus"]), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    used_events = set()
+    for c in candidates:
+        if len(selected) >= n_legs:
+            break
+        if avoid_same_event and c["event_id"] in used_events:
+            continue
+        reason = (
+            f"Consensus {c['consensus']:.2f} (implied {c['implied_consensus']*100:.1f}%), "
+            f"spread {c['spread_pct']*100:.2f}% — conservative pick"
+        )
+        selected.append({
+            "event_id": c["event_id"],
+            "sport_key": c.get("sport_key"),
+            "sport_title": c.get("sport_title"),
+            "event_title": c["event_title"],
+            "selection": c["selection"],
+            "price": c["price"],
+            "reason": reason,
+            "safety_score": c["safety_score"],
+            "commence_time": c.get("commence_time"),
+        })
+        used_events.add(c["event_id"])
+    return selected
+
 # --- New helper: ensure sport titles for events (fixes missing sport names) ---
 def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[str, Any]]) -> None:
     """
@@ -152,7 +333,6 @@ def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[s
     """
     smap = {s.get("key"): s.get("title") for s in (sports_list or [])}
     for ev in ev_list:
-        # check a few likely fields that might indicate sport or league
         candidate_keys = [
             ev.get("_sport_key"),
             ev.get("sport_key"),
@@ -163,7 +343,6 @@ def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[s
         sport_key = next((k for k in candidate_keys if k), None)
         if sport_key and not ev.get("_sport_title"):
             ev["_sport_title"] = smap.get(sport_key, sport_key)
-        # fallback: if still missing, set a readable fallback so UI isn't empty
         if not ev.get("_sport_title"):
             ev["_sport_title"] = ev.get("_sport_title") or "Unknown"
 
@@ -177,16 +356,17 @@ if "events_page" not in st.session_state:
 
 # ---- Header ----
 st.markdown("# 🎯 Parlay Builder — TheOddsAPI prototype")
-st.markdown("Browse events on the left, review and manage your parlay on the right. Use the Debug tab to inspect the loaded feed.")
+st.markdown("Browse events on the left, review and manage your parlay on the right. Use Debug to inspect loaded feed.")
 
 # ---- Top controls row (Load / Sport selector) ----
 top_cols = st.columns([3, 2, 1])
 with top_cols[0]:
-    st.info("Events browser / Auto-pick are in the left column tabs.")
+    st.info("Events browser / Auto-pick in left tabs; Parlay summary stays on the right.")
 with top_cols[1]:
     # fetch sports list to populate sport selector and title mapping
     sport_options = []
     sport_titles = {}
+    sports_list = []
     if API_KEY:
         try:
             sports_list = fetch_sports(API_KEY)
@@ -201,7 +381,6 @@ with top_cols[2]:
         try:
             loaded: List[Dict[str, Any]] = []
             if scan_all_sports:
-                # iterate sports and collect events
                 for skey, stitle in sport_titles.items():
                     try:
                         evs = fetch_odds_for_sport(API_KEY, skey, regions, markets, int(odds_ttl))
@@ -223,7 +402,7 @@ with top_cols[2]:
                     loaded = evs
 
             # ensure sport titles exist for all events (use sports_list mapping & fallbacks)
-            _ensure_sport_titles(loaded, sports_list if 'sports_list' in locals() else [])
+            _ensure_sport_titles(loaded, sports_list)
             st.session_state.events = loaded
             st.session_state.events_page = 1
             st.success(f"Loaded {len(loaded)} events.")
@@ -262,11 +441,9 @@ with left_col:
         # Filter & search logic
         filtered = []
         for ev in st.session_state.events:
-            # sport filter
             sport_title = ev.get("_sport_title") or ev.get("_sport_key") or ""
             if sport_filter and sport_filter != "All" and sport_title != sport_filter:
                 continue
-            # search
             title = ev.get("title") or " "
             teams_text = " ".join(ev.get("teams") or [])
             outcome_names = []
@@ -476,7 +653,6 @@ with left_col:
         with st.expander("⚠️ Debug (raw events & session)", expanded=False):
             st.write("Events loaded:", len(st.session_state.events))
             if st.session_state.events:
-                # show first event fields that matter for sport/title inspection
                 sample = st.session_state.events[0].copy()
                 keys_to_show = ["_sport_key", "_sport_title", "id", "title", "commence_time", "bookmakers"]
                 trimmed = {k: sample.get(k) for k in keys_to_show if k in sample}
@@ -539,7 +715,6 @@ with right_col:
             cols[0].markdown(f"**{leg.get('sport','')}** — {leg.get('title','')}  \n> **{leg.get('selection','')}**  @ {leg.get('price')}")
             rem_key = "rem-" + hashlib.sha1(f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}".encode()).hexdigest()[:12]
             if cols[1].button("Remove", key=rem_key):
-                # remove and rely on Streamlit rerun to refresh
                 st.session_state.parlay.pop(idx)
 
     # Parlay metrics & export
