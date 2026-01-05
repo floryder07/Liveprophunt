@@ -390,14 +390,16 @@ for p in user_players:
         merged["money"] = live["money"]
     merged_players.append(merged)
 
-# If TheOddsAPI is used and user didn't enter players manually, try to use props as player list
-players_from_props: List[Dict[str, Any]] = []
-if data_source == "TheOddsAPI (live props)" and not merged_players:
-    # take normalized_live items (they are already converted via to_player_record)
-    players_from_props = normalized_live
+# If TheOddsAPI is used, gather props list (normalized_live) for automatic population
+players_from_props: List[Dict[str, Any]] = normalized_live if data_source == "TheOddsAPI (live props)" else []
 
-# Final players list: prefer merged_players (user edited) else props else defaults
-players: List[Dict[str, Any]] = merged_players or players_from_props or DEFAULT_PLAYERS
+# Final players list:
+# - If TheOddsAPI selected, prefer props (so you don't need to manually type names)
+# - otherwise prefer merged_players (manual/sidebar) then props then defaults
+if data_source == "TheOddsAPI (live props)":
+    players: List[Dict[str, Any]] = players_from_props or merged_players or DEFAULT_PLAYERS
+else:
+    players: List[Dict[str, Any]] = merged_players or players_from_props or DEFAULT_PLAYERS
 
 # --- Auto-refresh (attempt to use streamlit-autorefresh if available) -------
 if auto_refresh_enabled:
