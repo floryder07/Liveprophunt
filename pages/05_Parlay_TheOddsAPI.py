@@ -1,11 +1,15 @@
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
-Fixes:
- - attach sport metadata to events so picks display sport/title/time
- - store sport and commence_time in parlay legs
- - improved display of selected legs (sport, start time, event, selection)
- - removed experimental_rerun usages and kept stable widget keys
+Updates in this version:
+- "Picked summary" panel: a compact, colored summary table showing sport, event, selection, start time, price and reason
+- Color-coded safety/value badges for picks (green/yellow/red)
+- Option to scan all sports (sidebar) so auto-picks can consider every sport (attaches sport metadata to events)
+- "Clear parlay" button
+- Fixes to ensure sport & player/selection names display correctly for manual and auto-added picks
+- Stable hashed widget keys; removed experimental_rerun usage
+Notes:
+- Scanning all sports may be rate-limited by TheOddsAPI free tier. Use with care.
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -37,8 +41,9 @@ bookmaker_filter = st.sidebar.text_input("Preferred bookmaker key/title (optiona
 odds_ttl = st.sidebar.number_input("Odds cache key (change to bust cache)", min_value=1, value=20, step=1)
 refresh = st.sidebar.button("Reload sports list / clear cache")
 
-# New: auto-filter DraftKings before 11 PT
+# New options
 filter_dk_before_11_pt = st.sidebar.checkbox("Auto-filter: DraftKings before 11:00 PT", value=False)
+scan_all_sports = st.sidebar.checkbox("Scan all sports for picks (may be slow / rate-limited)", value=False)
 
 if not API_KEY:
     st.sidebar.warning("No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here.")
@@ -48,7 +53,6 @@ def parse_iso_datetime(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # prefer dateutil if available for robust parsing
         from dateutil import parser as date_parser  # type: ignore
         dt = date_parser.isoparse(s)
     except Exception:
@@ -122,7 +126,7 @@ def has_draftkings(bookmakers: Optional[List[Dict[str, Any]]]) -> bool:
             return True
     return False
 
-# --- Auto-pick utilities (value-based heuristic) ---
+# --- Value & safety utilities ---
 def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     price_map: Dict[str, List[float]] = {}
     for bm in event.get("bookmakers", []):
@@ -141,13 +145,32 @@ def get_consensus_and_best_outcomes(event: Dict[str, Any]) -> List[Dict[str, Any
             continue
         cons = median(prices)
         best = max(prices)
-        results.append({"name": name, "consensus": cons, "best_price": best})
+        worst = min(prices)
+        results.append({"name": name, "consensus": cons, "best_price": best, "worst_price": worst})
     return results
 
 def score_outcome_value(consensus: float, best_price: float) -> float:
     if consensus <= 0:
         return 0.0
     return (best_price / consensus) - 1.0
+
+def get_outcome_safety_metrics(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metrics: List[Dict[str, Any]] = []
+    for o in get_consensus_and_best_outcomes(event):
+        cons = o["consensus"]
+        best = o["best_price"]
+        worst = o["worst_price"]
+        spread_pct = abs(worst - best) / cons if cons else 0.0
+        implied_consensus = (1.0 / cons) if cons > 0 else None
+        metrics.append({
+            "name": o["name"],
+            "consensus": cons,
+            "best": best,
+            "worst": worst,
+            "spread_pct": spread_pct,
+            "implied_consensus": implied_consensus,
+        })
+    return metrics
 
 def auto_pick_legs_by_value(
     events: List[Dict[str, Any]],
@@ -165,7 +188,6 @@ def auto_pick_legs_by_value(
             best = o["best_price"]
             value = score_outcome_value(cons, best)
             implied_consensus = (1.0 / cons) if cons > 0 else None
-            implied_best = (1.0 / best) if best > 0 else None
             favorite_flag = cons < 2.0 if cons else False
             candidates.append({
                 "event_id": ev_id,
@@ -175,9 +197,7 @@ def auto_pick_legs_by_value(
                 "consensus": cons,
                 "value": value,
                 "implied_consensus": implied_consensus,
-                "implied_best": implied_best,
                 "favorite": favorite_flag,
-                # pass sport metadata through if present
                 "sport_key": ev.get("_sport_key"),
                 "sport_title": ev.get("_sport_title"),
                 "commence_time": ev.get("commence_time") or ev.get("start")
@@ -196,12 +216,9 @@ def auto_pick_legs_by_value(
             continue
         reason_parts = []
         reason_parts.append(f"Best price {c['price']:.2f} vs consensus {c['consensus']:.2f} ({c['value']*100:.1f}% uplift)")
-        if c["favorite"]:
-            reason_parts.append("Market consensus marks this as a favorite.")
-        else:
-            reason_parts.append("Market consensus marks this as an underdog.")
-        if c["implied_best"] and c["implied_consensus"]:
-            reason_parts.append(f"Implied best prob {c['implied_best']*100:.1f}% vs consensus {c['implied_consensus']*100:.1f}%")
+        reason_parts.append("Favorite" if c["favorite"] else "Underdog")
+        if c["implied_consensus"]:
+            reason_parts.append(f"Implied {c['implied_consensus']*100:.1f}%")
         reason = " — ".join(reason_parts)
         selected.append({
             "event_id": c["event_id"],
@@ -219,6 +236,82 @@ def auto_pick_legs_by_value(
         used_events.add(c["event_id"])
     return selected
 
+def auto_pick_safest_legs(
+    events: List[Dict[str, Any]],
+    n_legs: int = 3,
+    max_decimal_odds: float = 1.8,
+    min_consensus_prob: float = 0.6,
+    max_spread_pct: float = 0.05,
+    require_bookmaker: Optional[str] = "draftkings",
+    avoid_same_event: bool = True,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for ev in events:
+        if require_bookmaker:
+            found = False
+            for bm in ev.get("bookmakers", []):
+                if (bm.get("key") or "").lower() == require_bookmaker.lower() or (bm.get("title") or "").lower().find(require_bookmaker.lower()) != -1:
+                    found = True
+                    break
+            if not found:
+                continue
+
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or ev.get("title")
+        title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        metrics = get_outcome_safety_metrics(ev)
+        for m in metrics:
+            cons = m["consensus"]
+            implied = m["implied_consensus"] or 0.0
+            best = m["best"]
+            spread = m["spread_pct"]
+            if best > max_decimal_odds:
+                continue
+            if implied < min_consensus_prob:
+                continue
+            if spread > max_spread_pct:
+                continue
+            safety_score = implied - (spread * 0.5)
+            candidates.append({
+                "event_id": ev_id,
+                "event_title": title,
+                "selection": m["name"],
+                "price": best,
+                "consensus": cons,
+                "implied_consensus": implied,
+                "spread_pct": spread,
+                "safety_score": safety_score,
+                "sport_key": ev.get("_sport_key"),
+                "sport_title": ev.get("_sport_title"),
+                "commence_time": ev.get("commence_time") or ev.get("start")
+            })
+
+    candidates.sort(key=lambda c: (c["safety_score"], c["implied_consensus"]), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    used_events = set()
+    for c in candidates:
+        if len(selected) >= n_legs:
+            break
+        if avoid_same_event and c["event_id"] in used_events:
+            continue
+        reason = (
+            f"Consensus {c['consensus']:.2f} (implied {c['implied_consensus']*100:.1f}%), "
+            f"spread {c['spread_pct']*100:.2f}% — conservative pick"
+        )
+        selected.append({
+            "event_id": c["event_id"],
+            "sport_key": c.get("sport_key"),
+            "sport_title": c.get("sport_title"),
+            "event_title": c["event_title"],
+            "selection": c["selection"],
+            "price": c["price"],
+            "reason": reason,
+            "safety_score": c["safety_score"],
+            "commence_time": c.get("commence_time")
+        })
+        used_events.add(c["event_id"])
+    return selected
+
 def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
     b = decimal_odds - 1.0
     if b <= 0 or p <= 0:
@@ -229,6 +322,16 @@ def kelly_fraction(p: float, decimal_odds: float, f: float = 0.25) -> float:
         return 0.0
     raw = numerator / denom
     return max(0.0, f * raw)
+
+def color_for_prob(p: Optional[float]) -> str:
+    # Return a CSS color code based on implied probability p
+    if p is None:
+        return "#999999"
+    if p >= 0.65:
+        return "#2ECC71"  # green
+    if p >= 0.5:
+        return "#F1C40F"  # yellow
+    return "#E67E22"  # orange
 
 # ---- UI: sports selector ----
 sports: List[Dict[str, Any]] = []
@@ -246,23 +349,41 @@ selected_sport = st.sidebar.selectbox(
 )
 
 # ---- Load events/odds ----
-load_odds_btn = st.sidebar.button("Load odds for sport")
+load_odds_btn = st.sidebar.button("Load odds for sport(s)")
 events: List[Dict[str, Any]] = []
 
-if selected_sport:
+if load_odds_btn:
+    # If scan_all_sports, iterate all sports; otherwise only selected_sport
     try:
-        raw_events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
-        # attach sport metadata onto each event for display & downstream logic
-        sport_title = sport_options.get(selected_sport, selected_sport)
-        for ev in raw_events:
-            ev["_sport_key"] = selected_sport
-            ev["_sport_title"] = sport_title
-        events = raw_events
+        if scan_all_sports:
+            all_events: List[Dict[str, Any]] = []
+            for skey, stitle in sport_options.items():
+                try:
+                    evs = fetch_odds_for_sport(API_KEY, skey, regions, markets, int(odds_ttl))
+                except Exception:
+                    continue
+                for ev in evs:
+                    ev["_sport_key"] = skey
+                    ev["_sport_title"] = stitle
+                all_events.extend(evs)
+            events = all_events
+            if not events:
+                st.sidebar.info("No events found across sports (API limits or no matches).")
+        else:
+            if not selected_sport:
+                st.sidebar.info("Choose a sport or enable 'Scan all sports'.")
+            else:
+                raw_events = fetch_odds_for_sport(API_KEY, selected_sport, regions, markets, int(odds_ttl))
+                sport_title = sport_options.get(selected_sport, selected_sport)
+                for ev in raw_events:
+                    ev["_sport_key"] = selected_sport
+                    ev["_sport_title"] = sport_title
+                events = raw_events
     except Exception as e:
         st.sidebar.error(f"Could not load odds: {e}")
         events = []
 
-# Sample fallback (include sport metadata)
+# Sample fallback (include sport metadata) if no events
 if not events:
     st.info("No live feed loaded — using sample events.")
     events = [
@@ -295,10 +416,9 @@ if "parlay" not in st.session_state:
     st.session_state.parlay = []
 
 def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title: Optional[str] = None, commence_time: Optional[str] = None) -> None:
-    # prevent duplicate same-event leg
     for leg in st.session_state.parlay:
-        if leg["event_id"] == ev_id:
-            st.warning("You already added a leg from this event. Remove it first to add another selection.")
+        if leg["event_id"] == ev_id and leg["selection"] == sel_name:
+            st.warning("That leg is already in the parlay. Remove it first to add again.")
             return
     st.session_state.parlay.append({
         "event_id": ev_id,
@@ -312,6 +432,9 @@ def add_leg(ev_id: str, ev_title: str, sel_name: str, price: float, sport_title:
 def remove_leg(i: int) -> None:
     if 0 <= i < len(st.session_state.parlay):
         st.session_state.parlay.pop(i)
+
+def clear_parlay() -> None:
+    st.session_state.parlay = []
 
 # ---- Main layout ----
 left, right = st.columns([2, 1])
@@ -345,14 +468,57 @@ with left:
 with right:
     st.header("Parlay builder")
 
-    # --- Auto-pick controls ---
-    st.subheader("Auto-pick by market value")
+    # Picked summary (compact + color)
+    st.subheader("Picked summary")
+    picked_html = """
+    <style>
+      .pill {display:inline-block;padding:4px 8px;border-radius:999px;color:#fff;font-size:12px;margin-right:6px;}
+      table.picks {width:100%;border-collapse:collapse;}
+      table.picks th, table.picks td {padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px;}
+    </style>
+    """
+    picked_html += "<table class='picks'><thead><tr><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Reason</th></tr></thead><tbody>"
+    for leg in st.session_state.parlay:
+        prob = None
+        # try to infer implied prob from price
+        try:
+            prob = 1.0 / float(leg.get("price", 0))
+        except Exception:
+            prob = None
+        color = color_for_prob(prob)
+        sport = leg.get("sport") or ""
+        start = leg.get("commence_time") or ""
+        picked_html += (
+            f"<tr>"
+            f"<td><span class='pill' style='background:{color}'>{sport}</span></td>"
+            f"<td>{leg.get('title','')}</td>"
+            f"<td><strong>{leg.get('selection','')}</strong></td>"
+            f"<td>{start}</td>"
+            f"<td>{leg.get('price')}</td>"
+            f"<td>{leg.get('reason','')}</td>"
+            f"</tr>"
+        )
+    if not st.session_state.parlay:
+        picked_html += "<tr><td colspan='6'><em>No picks yet</em></td></tr>"
+    picked_html += "</tbody></table>"
+    st.markdown(picked_html, unsafe_allow_html=True)
+
+    # controls: auto-pick value & safety
+    st.subheader("Auto-pick options")
     auto_n = st.number_input("Number of legs to pick", min_value=1, max_value=10, value=3)
     auto_min_pct = st.slider("Minimum uplift vs consensus (%)", min_value=0, max_value=50, value=2)
     auto_min_value = auto_min_pct / 100.0
     avoid_same_event = st.checkbox("Avoid >1 leg per event", value=True)
-    preview_only = st.checkbox("Preview only (don't auto-add)", value=False)
-    if st.button("Auto-pick by market value"):
+    preview_only = st.checkbox("Preview only (don't auto-add)", value=True)
+
+    # Safety pick controls
+    st.write("Safety pick filters (conservative):")
+    max_decimal_odds = st.number_input("Max decimal odds per leg", value=1.8, step=0.05, format="%.2f")
+    min_consensus_prob = st.slider("Minimum consensus implied probability (%)", min_value=30, max_value=90, value=60) / 100.0
+    max_spread_pct = st.slider("Max spread across books (%)", min_value=0, max_value=20, value=5) / 100.0
+    require_dk = st.checkbox("Require DraftKings for safety picks", value=True)
+
+    if st.button("Auto-pick (value)"):
         filtered_events = events
         if filter_dk_before_11_pt and ZoneInfo is not None:
             tz = ZoneInfo("America/Los_Angeles")
@@ -362,43 +528,80 @@ with right:
             for ev in events:
                 if not has_draftkings(ev.get("bookmakers", [])):
                     continue
-                ct = ev.get("commence_time") or ev.get("start") or ev.get("commence_time")
+                ct = ev.get("commence_time") or ev.get("start")
                 dt = parse_iso_datetime(ct)
                 if not dt:
                     continue
-                dt_local = dt.astimezone(tz)
-                if dt_local < cutoff:
+                if dt.astimezone(tz) < cutoff:
                     fe.append(ev)
             filtered_events = fe
 
         picks = auto_pick_legs_by_value(filtered_events, n_legs=auto_n, min_value=auto_min_value, avoid_same_event=avoid_same_event)
         if not picks:
-            st.warning("No picks met the criteria.")
+            st.warning("No value picks met the criteria.")
         else:
-            st.success(f"Found {len(picks)} pick(s). {'Previewing — not added.' if preview_only else 'Added to parlay.'}")
+            st.success(f"Found {len(picks)} value pick(s).")
             for p in picks:
+                # display pick summary and optionally add
                 p_sport = p.get("sport_title") or p.get("sport_key") or ""
                 p_ct = p.get("commence_time") or ""
-                with st.expander(f"{p_sport} — {p['event_title']} — {p['selection']} @ {p['price']}"):
-                    st.write("Reason:", p["reason"])
-                    st.write(f"Consensus: {p['consensus']:.2f} | Value uplift: {p['value']*100:.2f}%")
-                    if p.get("implied_consensus"):
-                        kf = kelly_fraction(p["implied_consensus"], p["price"], f=0.25)
-                        st.write(f"Suggested Kelly fraction (conservative 25% Kelly): {kf*100:.2f}% of bankroll (theoretical).")
-                    if not preview_only:
-                        add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p_sport, commence_time=p_ct)
+                st.markdown(f"**{p_sport}** — {p['event_title']} — **{p['selection']}** @ {p['price']}")
+                st.write(p["reason"])
+                if not preview_only:
+                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p_sport, commence_time=p_ct)
 
-    # ---- Current parlay UI ----
+    if st.button("Auto-pick (safest)"):
+        filtered_events = events
+        if filter_dk_before_11_pt and ZoneInfo is not None:
+            tz = ZoneInfo("America/Los_Angeles")
+            now = datetime.now(tz)
+            cutoff = datetime.combine(now.date(), time(hour=11, minute=0), tzinfo=tz)
+            fe: List[Dict[str, Any]] = []
+            for ev in events:
+                if not has_draftkings(ev.get("bookmakers", [])):
+                    continue
+                ct = ev.get("commence_time") or ev.get("start")
+                dt = parse_iso_datetime(ct)
+                if not dt:
+                    continue
+                if dt.astimezone(tz) < cutoff:
+                    fe.append(ev)
+            filtered_events = fe
+
+        picks = auto_pick_safest_legs(
+            filtered_events,
+            n_legs=auto_n,
+            max_decimal_odds=max_decimal_odds,
+            min_consensus_prob=min_consensus_prob,
+            max_spread_pct=max_spread_pct,
+            require_bookmaker="draftkings" if require_dk else None,
+            avoid_same_event=avoid_same_event
+        )
+        if not picks:
+            st.warning("No safe picks found with these filters.")
+        else:
+            st.success(f"Found {len(picks)} safe pick(s).")
+            for p in picks:
+                st.markdown(f"**{p.get('sport_title') or ''}** — {p['event_title']} — **{p['selection']}** @ {p['price']}")
+                st.write(p["reason"])
+                if not preview_only:
+                    add_leg(p['event_id'], p['event_title'], p['selection'], p['price'], sport_title=p.get("sport_title"), commence_time=p.get("commence_time"))
+
+    st.markdown("---")
+    # Current parlay UI (detailed)
+    st.subheader("Current parlay")
     legs = st.session_state.parlay
+    cols = st.columns([1, 1])
+    if st.button("Clear parlay"):
+        clear_parlay()
     if not legs:
-        st.info("Add legs from the left column or use Auto-pick.")
+        st.info("No legs added. Use Auto-pick or Add buttons on the left.")
     else:
         for idx, leg in enumerate(legs):
-            c = st.columns([3, 1])
-            # show sport, start time, event, and selection clearly
+            c = st.columns([4, 1])
             start_txt = f" • starts {leg['commence_time']}" if leg.get("commence_time") else ""
-            c[0].markdown(f"**{leg.get('sport','')}** — **{leg.get('title','')}**{start_txt}  \n"
-                          f"> {leg.get('selection','')}  @ {leg.get('price')}")
+            sport_chip = f"<span style='background:{color_for_prob(1.0/leg['price'] if leg.get('price') else None)};color:#fff;padding:4px 8px;border-radius:999px;font-size:12px'>{leg.get('sport','')}</span>"
+            st.markdown(f"{sport_chip}  **{leg.get('title','')}**{start_txt}  \n> **{leg.get('selection','')}**  @ {leg.get('price')}", unsafe_allow_html=True)
             rem_raw = f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}"
             rem_key = "rem-" + hashlib.sha1(rem_raw.encode()).hexdigest()[:12]
             if c[1].button("Remove", key=rem_key):
