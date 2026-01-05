@@ -1,3 +1,4 @@
+```python name=pages/05_Parlay_TheOddsAPI.py
 """
 Parlay Builder — TheOddsAPI prototype (Streamlit)
 
@@ -11,7 +12,7 @@ Usage:
 """
 from typing import Any, Dict, List, Optional
 import os
-import math
+import hashlib
 import requests
 import streamlit as st
 from datetime import datetime
@@ -22,7 +23,9 @@ st.title("🎯 Parlay Builder — TheOddsAPI prototype")
 
 # ---- Sidebar: API key and options ----
 st.sidebar.header("Settings / TheOddsAPI")
-api_key_input = st.sidebar.text_input("TheOddsAPI Key (or leave blank to use THEODDS_API_KEY env)", type="password")
+api_key_input = st.sidebar.text_input(
+    "TheOddsAPI Key (or leave blank to use THEODDS_API_KEY env)", type="password"
+)
 API_KEY = api_key_input.strip() or os.environ.get("THEODDS_API_KEY", "")
 
 regions = st.sidebar.multiselect("Regions (comma-select)", options=["us", "uk", "eu", "au"], default=["us"])
@@ -58,7 +61,7 @@ def fetch_sports(api_key: str) -> List[Dict[str, Any]]:
     resp.raise_for_status()
     return resp.json()
 
-# Note: include odds_ttl as a parameter so changing it busts the cache.
+# include cache-bust param so changing the odds_ttl invalidates the cache
 @st.cache_data()
 def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], markets_list: List[str], cache_bust: int) -> List[Dict[str, Any]]:
     regions_q = ",".join(regions_list)
@@ -68,7 +71,7 @@ def fetch_odds_for_sport(api_key: str, sport_key: str, regions_list: List[str], 
     resp.raise_for_status()
     return resp.json()
 
-def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str]=None) -> List[Dict[str, Any]]:
+def extract_outcomes(event: Dict[str, Any], bookmaker_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     outcomes = []
     for bm in event.get("bookmakers", []):
         if bookmaker_filter and bookmaker_filter.strip():
@@ -121,7 +124,12 @@ def score_outcome_value(consensus: float, best_price: float) -> float:
         return 0.0
     return (best_price / consensus) - 1.0
 
-def auto_pick_legs_by_value(events: List[Dict,], n_legs: int = 3, min_value: float = 0.02, avoid_same_event: bool = True) -> List[Dict[str, Any]]:
+def auto_pick_legs_by_value(
+    events: List[Dict[str, Any]],
+    n_legs: int = 3,
+    min_value: float = 0.02,
+    avoid_same_event: bool = True,
+) -> List[Dict[str, Any]]:
     """
     Returns a list of picks:
       { event_id, event_title, selection, price, consensus, value, implied_consensus, reason }
@@ -208,7 +216,11 @@ if API_KEY:
         st.sidebar.error(f"Could not fetch sports list: {e}")
 
 sport_options = {s.get("key"): s.get("title") for s in sports}
-selected_sport = st.sidebar.selectbox("Sport (select)", options=[""] + list(sport_options.keys()), format_func=lambda k: sport_options.get(k, " — choose sport — "))
+selected_sport = st.sidebar.selectbox(
+    "Sport (select)",
+    options=[""] + list(sport_options.keys()),
+    format_func=lambda k: sport_options.get(k, " — choose sport — "),
+)
 
 # ---- Load events/odds ----
 load_odds_btn = st.sidebar.button("Load odds for sport")
@@ -231,14 +243,18 @@ if not events:
             "title": "Ma Long vs Fan Zhendong",
             "commence_time": "2026-01-05T12:00:00Z",
             "teams": ["Ma Long", "Fan Zhendong"],
-            "bookmakers": [{"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Ma Long","price":1.45},{"name":"Fan Zhendong","price":2.10}]}]}]
+            "bookmakers": [
+                {"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Ma Long","price":1.45},{"name":"Fan Zhendong","price":2.10}]}]}
+            ]
         },
         {
             "id": "ev-2",
             "title": "Player A vs Player B",
             "commence_time": "2026-01-05T13:30:00Z",
             "teams": ["Player A", "Player B"],
-            "bookmakers": [{"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Player A","price":1.80},{"name":"Player B","price":2.00}]}]}]
+            "bookmakers": [
+                {"key":"draftkings","markets":[{"key":"h2h","outcomes":[{"name":"Player A","price":1.80},{"name":"Player B","price":2.00}]}]}
+            ]
         }
     ]
 
@@ -271,11 +287,17 @@ with left:
             with st.expander(f"{title} (no odds)"):
                 st.write("No usable odds/outcomes found for this event.")
             continue
+
         with st.expander(title):
             for o in outs:
                 cols = st.columns([4, 1])
                 cols[0].write(f"{o['name']}  —  {o['price']} (market: {o['market']} | bm: {o['bookmaker']})")
-                if cols[1].button("Add", key=f"add-{ev_id}-{o['name']}"):
+
+                # unique key for add button using a stable hash
+                raw_key = f"{ev_id}|{o.get('name','')}|{o.get('market','')}|{o.get('bookmaker','')}"
+                add_key = "add-" + hashlib.sha1(raw_key.encode()).hexdigest()[:12]
+
+                if cols[1].button("Add", key=add_key):
                     add_leg(ev_id, title, o["name"], o["price"])
 
 with right:
@@ -312,7 +334,12 @@ with right:
         for idx, leg in enumerate(legs):
             c = st.columns([3, 1])
             c[0].markdown(f"**{leg['title']}** — {leg['selection']} @ {leg['price']}")
-            if c[1].button("Remove", key=f"rem-{idx}"):
+
+            # unique key for remove button
+            rem_raw = f"{idx}|{leg.get('event_id','')}|{leg.get('selection','')}"
+            rem_key = "rem-" + hashlib.sha1(rem_raw.encode()).hexdigest()[:12]
+
+            if c[1].button("Remove", key=rem_key):
                 remove_leg(idx)
 
     st.markdown("---")
@@ -332,4 +359,8 @@ with right:
             if st.button("Simulate parlay"):
                 st.success(f"Simulated: stake ${stake:.2f} → payout ${payout:,.2f} (profit ${profit:,.2f})")
 
-st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
+st.caption(
+    "Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). "
+    "This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing."
+)
+```
