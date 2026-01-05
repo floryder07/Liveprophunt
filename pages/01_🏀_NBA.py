@@ -214,4 +214,88 @@ if auto_refresh_enabled:
         from streamlit_autorefresh import st_autorefresh
 
         # st_autorefresh expects milliseconds
-        st_autorefresh(interval=auto_refresh_interval *
+        st_autorefresh(interval=auto_refresh_interval * 1000, key="autorefresh")
+    except Exception:
+        # streamlit-autorefresh not installed: show a hint and rely on manual refresh button
+        st.sidebar.info("Install 'streamlit-autorefresh' to enable true client-side auto-refresh.")
+
+
+# --- UI helpers ---------------------------------------------------------------
+def render_player_card(player: Dict[str, Any], show_pace: bool = True, show_target: bool = True) -> None:
+    """Render a player card into the current Streamlit column context."""
+    st.subheader(player["name"])
+
+    metric_label = f"Live {player.get('stat_label', 'Stat')}"
+    # The delta string may include text like "+2.5 vs Line" — try to extract numeric prefix for clearer coloring
+    delta_display = player.get("delta", "")
+    # Attempt to coerce delta to numeric if it starts with +/-
+    delta_numeric = None
+    if isinstance(delta_display, (int, float)):
+        delta_numeric = delta_display
+    elif isinstance(delta_display, str) and delta_display.strip():
+        # Extract leading signed number
+        import re
+
+        m = re.match(r"^([+-]?\d+(\.\d+)?)", delta_display.strip())
+        if m:
+            try:
+                delta_numeric = float(m.group(1))
+            except Exception:
+                delta_numeric = None
+
+    # Use Streamlit's metric (it will color positive deltas green, negative red)
+    if delta_numeric is not None:
+        st.metric(label=metric_label, value=str(player.get("live_value", "—")), delta=f"{delta_numeric}")
+    else:
+        # Keep delta as string if not numeric
+        st.metric(label=metric_label, value=str(player.get("live_value", "—")), delta=str(delta_display))
+
+    # Build caption with target/pace and a status emoji vs target
+    caption_parts = []
+    target = player.get("target")
+    live_value = player.get("live_value")
+    if show_target and target is not None:
+        # Status relative to target
+        status = ""
+        try:
+            if isinstance(live_value, (int, float)) and isinstance(target, (int, float)):
+                if live_value >= target:
+                    status = "✅"  # favorable
+                else:
+                    status = "⚠️"  # below
+        except Exception:
+            status = ""
+        caption_parts.append(f"Target: {target} {status}")
+
+    if show_pace and player.get("pace") not in (None, ""):
+        caption_parts.append(f"Pace: {player.get('pace')}")
+
+    if caption_parts:
+        st.caption(" | ".join(caption_parts))
+
+
+# --- Main layout -------------------------------------------------------------
+st.title("🏀 NBA Player Prop Tracker")
+
+col_refresh, _ = st.columns([1, 6])
+with col_refresh:
+    if st.button("Refresh now"):
+        st.experimental_rerun()
+
+if not players:
+    st.info("No players configured. Use the sidebar to add players or select a data source.")
+else:
+    cols = st.columns(num_cols)
+    for idx, player in enumerate(players):
+        col = cols[idx % num_cols]
+        with col:
+            render_player_card(player, show_pace=show_pace, show_target=show_target)
+
+# Footer
+st.write("---")
+st.caption(
+    "Notes: \n"
+    "- Use the sidebar to select a data source (Mock/CSV/URL/REST).\n"
+    "- For Google Sheets, use the sheet's CSV export URL (export?format=csv).\n"
+    "- To enable client-side auto-refresh install: pip install streamlit-autorefresh"
+)
