@@ -1,11 +1,8 @@
+```python name=pages/05_Parlay_TheOddsAPI.py url=https://github.com/floryder07/Liveprophunt/blob/main/pages/05_Parlay_TheOddsAPI.py
 # Parlay Builder — TheOddsAPI prototype (safe-only, show top safe candidates)
 #
-# Copy this file content exactly (do NOT include the surrounding triple-backtick lines)
-# into pages/05_Parlay_TheOddsAPI.py (or parlay_builder.py) to replace the broken page.
-# After saving, run:
-#   python -m py_compile pages/05_Parlay_TheOddsAPI.py
-# to confirm syntax, then restart Streamlit.
-
+# Fully merged version: safe picks, "Show top N safe candidates", "Add safest picks",
+# show-full-id toggle, and auto-load helper when API key + Scan all sports is enabled.
 from typing import Any, Dict, List, Optional
 import os
 import hashlib
@@ -39,7 +36,9 @@ scan_all_sports = st.sidebar.checkbox("Scan all sports for picks (may be slow / 
 filter_bm_before_11_pt = st.sidebar.checkbox("Auto-filter by bookmaker before 11:00 PT", value=False)
 st.sidebar.markdown("---")
 if not API_KEY:
-    st.sidebar.warning("No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here.")
+    st.sidebar.warning(
+        "No API key set. Get one at https://the-odds-api.com/ and put it in THEODDS_API_KEY or paste here."
+    )
 
 # ---- Utilities & data functions ----
 def _safe_name(o: Dict[str, Any]) -> str:
@@ -115,7 +114,83 @@ def has_bookmaker(bookmakers: Optional[List[Dict[str, Any]]], needle: str) -> bo
             return True
     return False
 
-# --- Auto-pick functions ---
+# --- Auto-pick functions (value + safest) ---
+def auto_pick_legs_by_value(
+    events: List[Dict[str, Any]],
+    n_legs: int = 3,
+    min_value: float = 0.02,
+    avoid_same_event: bool = True,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for ev in events:
+        ev_id = ev.get("id") or ev.get("event_id") or ev.get("key") or None
+        if not ev_id:
+            continue
+        title = ev.get("title") or " vs ".join(ev.get("teams", [])) or str(ev_id)
+        price_map: Dict[str, List[float]] = {}
+        for bm in ev.get("bookmakers", []):
+            for m in bm.get("markets", []):
+                for o in m.get("outcomes", []):
+                    name = _safe_name(o)
+                    price = _safe_price_from_outcome(o)
+                    if price is None:
+                        continue
+                    price_map.setdefault(name, []).append(price)
+
+        for name, prices in price_map.items():
+            if not prices:
+                continue
+            cons = median(prices)
+            best = max(prices)
+            value = (best / cons - 1.0) if cons else 0.0
+            implied_consensus = (1.0 / cons) if cons and cons > 0 else 0.0
+            favorite_flag = cons < 2.0 if cons else False
+            candidates.append({
+                "event_id": ev_id,
+                "event_title": title,
+                "selection": name,
+                "price": best,
+                "consensus": cons,
+                "value": value,
+                "implied_consensus": implied_consensus,
+                "favorite": favorite_flag,
+                "sport_key": ev.get("_sport_key"),
+                "sport_title": ev.get("_sport_title"),
+                "commence_time": ev.get("commence_time") or ev.get("start"),
+            })
+
+    candidates.sort(key=lambda c: (c["value"], c["price"]), reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    used_events = set()
+    for c in candidates:
+        if len(selected) >= n_legs:
+            break
+        if c["value"] < min_value:
+            continue
+        if avoid_same_event and c["event_id"] in used_events:
+            continue
+        reason_parts = [f"Best price {c['price']:.2f} vs consensus {c['consensus']:.2f} ({c['value']*100:.1f}% uplift)"]
+        reason_parts.append("Favorite" if c["favorite"] else "Underdog")
+        if c["implied_consensus"]:
+            reason_parts.append(f"Implied {c['implied_consensus']*100:.1f}%")
+        reason = " — ".join(reason_parts)
+        selected.append({
+            "event_id": c["event_id"],
+            "sport_key": c.get("sport_key"),
+            "sport_title": c.get("sport_title"),
+            "event_title": c["event_title"],
+            "selection": c["selection"],
+            "price": c["price"],
+            "consensus": c["consensus"],
+            "value": c["value"],
+            "implied_consensus": c["implied_consensus"],
+            "reason": reason,
+            "commence_time": c.get("commence_time"),
+        })
+        used_events.add(c["event_id"])
+    return selected
+
 def auto_pick_safest_legs(
     events: List[Dict[str, Any]],
     n_legs: int = 3,
@@ -162,8 +237,8 @@ def auto_pick_safest_legs(
             })
 
     candidates.sort(key=lambda c: (c.get("safety_score", 0.0), c.get("implied_consensus", 0.0)), reverse=True)
-    # Return the full candidate list (caller will slice)
-    return candidates
+    selected = candidates  # return full candidate list; caller slices by top_n or n_legs
+    return selected
 
 # --- Helper: ensure sport titles for events ---
 def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[str, Any]]) -> None:
@@ -204,7 +279,9 @@ with top_cols[1]:
         except Exception:
             sport_options = []
             sport_titles = {}
-    chosen_sport_for_load = st.selectbox("Sport (for load)", options=[""] + sport_options, format_func=lambda k: sport_titles.get(k, " — choose sport — "))
+    chosen_sport_for_load = st.selectbox(
+        "Sport (for load)", options=[""] + sport_options, format_func=lambda k: sport_titles.get(k, " — choose sport — ")
+    )
 with top_cols[2]:
     if st.button("Load odds for sport(s)"):
         try:
@@ -246,7 +323,9 @@ with left_col:
     with tabs[0]:
         st.subheader("Events browser")
         search_text = st.text_input("Search (event title, team, selection)", value="")
-        sport_filter = st.selectbox("Filter by sport", options=["All"] + sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "Unknown" for ev in st.session_state.events})))
+        sport_filter = st.selectbox(
+            "Filter by sport", options=["All"] + sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "Unknown" for ev in st.session_state.events}))
+        )
         sort_by = st.selectbox("Sort by", options=["Start time", "Odds value (best uplift)", "Sport", "Title"])
         page_size = st.number_input("Events per page", min_value=2, max_value=50, value=8, step=1)
         total_events = len(st.session_state.events)
@@ -384,13 +463,106 @@ with left_col:
             return s_events
 
         col_ap = st.columns([1, 1, 2])
-        if col_ap[0].button("Preview safest picks"):
-            picks = auto_pick_safest_legs(_auto_pick_source_events(), n_legs=int(auto_n), max_decimal_odds=float(max_decimal_odds), min_consensus_prob=float(min_consensus_prob), max_spread_pct=float(max_spread_pct), require_bookmaker=(require_bm if require_bm.strip() else None), avoid_same_event=avoid_same_event)
+        if col_ap[0].button("Preview value picks"):
+            picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
             if not picks:
-                st.warning("No safe picks found with current filters.")
+                st.warning("No value picks found with current filters — showing top candidate pool (debug):")
+                cand = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=200, min_value=0.0, avoid_same_event=False)
+                st.write("Candidate count (uplift >= 0):", len(cand))
+                for i, c in enumerate(cand[:40]):
+                    sport = c.get("sport_title") or c.get("sport_key") or ""
+                    title = c.get("event_title") or ""
+                    selection = c.get("selection") or ""
+                    price = c.get("price")
+                    uplift_pct = c.get("value", 0) * 100.0
+                    implied = c.get("implied_consensus") or 0.0
+                    st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | uplift {uplift_pct:.2f}% | implied {implied:.3f}")
             else:
-                for p in picks[:20]:
-                    st.write(f"{p.get('sport_title') or ''} — {p.get('event_title')}\n  {p.get('selection')} @ {p.get('price')} — safety {p.get('safety_score')}")
+                for p in picks:
+                    st.write(f"{p.get('sport_title') or ''} — {p['event_title']}\n  {p['selection']} @ {p['price']} — {p['reason']}")
+        if col_ap[1].button("Add value picks"):
+            picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
+            if not picks:
+                st.warning("No value picks found.")
+            else:
+                added = 0
+                for p in picks:
+                    exists = any((leg.get("event_id") == p["event_id"] and leg.get("selection") == p["selection"]) for leg in st.session_state.parlay)
+                    if not exists:
+                        st.session_state.parlay.append({
+                            "event_id": p["event_id"],
+                            "sport": p.get("sport_title") or p.get("sport_key") or "",
+                            "title": p["event_title"],
+                            "selection": p["selection"],
+                            "price": p["price"],
+                            "commence_time": p.get("commence_time"),
+                            "reason": p.get("reason"),
+                        })
+                        added += 1
+                st.success(f"Added {added} picks to parlay.")
+        if col_ap[2].button("Preview safest picks"):
+            picks = auto_pick_safest_legs(
+                _auto_pick_source_events(),
+                n_legs=int(auto_n),
+                max_decimal_odds=float(max_decimal_odds),
+                min_consensus_prob=float(min_consensus_prob),
+                max_spread_pct=float(max_spread_pct),
+                require_bookmaker=(require_bm if require_bm.strip() else None),
+                avoid_same_event=avoid_same_event,
+            )
+            if not picks:
+                st.warning("No safe picks found with current filters — showing top safe candidates (relaxed debug):")
+                cand = auto_pick_safest_legs(
+                    _auto_pick_source_events(),
+                    n_legs=200,
+                    max_decimal_odds=5.0,
+                    min_consensus_prob=0.0,
+                    max_spread_pct=1.0,
+                    require_bookmaker=None,
+                    avoid_same_event=False,
+                )
+                st.write("Safe candidate count (relaxed):", len(cand))
+                for i, c in enumerate(cand[:40]):
+                    sport = c.get("sport_title") or ""
+                    title = c.get("event_title") or ""
+                    selection = c.get("selection") or ""
+                    price = c.get("price")
+                    implied = c.get("implied_consensus") or 0.0
+                    spread = c.get("spread_pct") or 0.0
+                    st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | implied {implied:.3f} | spread {spread:.3f}")
+            else:
+                for p in picks:
+                    st.write(f"{p.get('sport_title') or ''} — {p['event_title']}\n  {p['selection']} @ {p['price']} — {p['reason']}")
+
+        # Add safest picks button (adds the selected safest picks to the session parlay)
+        if st.button("Add safest picks"):
+            picks_to_add = auto_pick_safest_legs(
+                _auto_pick_source_events(),
+                n_legs=int(auto_n),
+                max_decimal_odds=float(max_decimal_odds),
+                min_consensus_prob=float(min_consensus_prob),
+                max_spread_pct=float(max_spread_pct),
+                require_bookmaker=(require_bm if require_bm.strip() else None),
+                avoid_same_event=avoid_same_event,
+            )
+            if not picks_to_add:
+                st.warning("No safe picks found to add.")
+            else:
+                added = 0
+                for p in picks_to_add:
+                    exists = any((leg.get("event_id") == p["event_id"] and leg.get("selection") == p["selection"]) for leg in st.session_state.parlay)
+                    if not exists:
+                        st.session_state.parlay.append({
+                            "event_id": p["event_id"],
+                            "sport": p.get("sport_title") or p.get("sport_key") or "",
+                            "title": p["event_title"],
+                            "selection": p["selection"],
+                            "price": p["price"],
+                            "commence_time": p.get("commence_time"),
+                            "reason": p.get("reason") or f"Auto-safe (score {p.get('safety_score')})",
+                        })
+                        added += 1
+                st.success(f"Added {added} safe picks to parlay.")
 
         # Show top N safe candidates (improved display, ID toggle, auto-load helper)
         st.markdown("---")
@@ -545,3 +717,4 @@ with right_col:
         st.write("Add some legs to see metrics.")
 
 st.caption("Prototype uses TheOddsAPI. Auto-picks are heuristic suggestions (value vs market consensus). This is a simulation tool only — do not auto-place real bets without user confirmation and proper licensing.")
+```
