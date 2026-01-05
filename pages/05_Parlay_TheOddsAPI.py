@@ -1,19 +1,22 @@
 """
 Parlay Builder — TheOddsAPI prototype
 
-Merged / fixed file:
+Final merged file:
 - All helper functions defined before UI (no NameError).
 - auto_pick_legs_by_value and auto_pick_safest_legs included.
 - Ensures _sport_title is set for every loaded event.
 - Improved layout (Events / Auto-pick / Debug tabs) and persistent Parlay summary.
 - Debug panel included to inspect loaded events and sport titles.
-- No use of st.experimental_rerun (removed).
+- Color-coded safety badges (green/orange/red) for picks.
+- "Open on DraftKings" search links for each pick and "open all" links.
+- No automatic bet placement (only opens DraftKings search pages).
 - Stable widget keys for Add/Remove buttons.
 """
 from typing import Any, Dict, List, Optional
 import os
 import hashlib
 import json
+from urllib.parse import quote_plus
 import requests
 import streamlit as st
 from datetime import datetime, time, timezone
@@ -346,6 +349,54 @@ def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[s
         if not ev.get("_sport_title"):
             ev["_sport_title"] = ev.get("_sport_title") or "Unknown"
 
+# ---- DraftKings link + safety helpers ----
+def build_draftkings_search_url(selection: str, event_title: str) -> str:
+    """
+    Build a DraftKings sportsbook search URL for the selection + event.
+    This opens DraftKings search with the query prefilled.
+    """
+    query = f"{selection} {event_title}"
+    encoded = quote_plus(query)
+    return f"https://sportsbook.draftkings.com/search?query={encoded}"
+
+# Safety thresholds (tweak these as you like)
+SAFE_PROB_THRESHOLD = 0.60    # implied prob >= 60% -> safe (green)
+MIDDLE_PROB_THRESHOLD = 0.45  # implied prob >= 45% -> middle (orange)
+
+def safety_level_for_leg(leg: dict) -> str:
+    """
+    Return 'safe' | 'middle' | 'danger' based on safety_score or implied prob (1/price).
+    """
+    # prefer explicit safety_score if present (auto-pick safest adds it)
+    if leg.get("safety_score") is not None:
+        try:
+            s = float(leg["safety_score"])
+            if s >= 0.25:
+                return "safe"
+            if s >= 0.05:
+                return "middle"
+            return "danger"
+        except Exception:
+            pass
+
+    # fallback: implied probability from price
+    try:
+        p = 1.0 / float(leg.get("price", 0))
+    except Exception:
+        p = 0.0
+    if p >= SAFE_PROB_THRESHOLD:
+        return "safe"
+    if p >= MIDDLE_PROB_THRESHOLD:
+        return "middle"
+    return "danger"
+
+def color_for_level(level: str) -> str:
+    return {
+        "safe": "#2ECC71",    # green
+        "middle": "#F39C12",  # orange
+        "danger": "#E74C3C",  # red
+    }.get(level, "#999999")
+
 # ---- Session state defaults ----
 if "events" not in st.session_state:
     st.session_state.events = []
@@ -664,41 +715,50 @@ with left_col:
 with right_col:
     st.header("Parlay summary")
 
-    # Picked summary (HTML table)
-    def render_parlay_table():
+    # Picked summary: color badges + DraftKings links
+    def render_parlay_table_with_links():
         picked_html = """
         <style>
-          .pill {display:inline-block;padding:4px 8px;border-radius:999px;color:#fff;font-size:12px;margin-right:6px;}
+          .pill {display:inline-block;padding:6px 10px;border-radius:999px;color:#fff;font-size:12px;margin-right:6px;}
           table.picks {width:100%;border-collapse:collapse;}
-          table.picks th, table.picks td {padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px;}
+          table.picks th, table.picks td {padding:6px;border-bottom:1px solid #eee;text-align:left;font-size:13px;vertical-align:middle}
+          .dk-link {background:#111;color:#fff;padding:6px 8px;border-radius:6px;text-decoration:none}
         </style>
         """
-        picked_html += "<table class='picks'><thead><tr><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Reason</th></tr></thead><tbody>"
-        for leg in st.session_state.parlay:
-            prob = None
-            try:
-                prob = 1.0 / float(leg.get("price", 0))
-            except Exception:
-                prob = None
-            color = color_for_prob(prob)
+        picked_html += "<table class='picks'><thead><tr><th>Safety</th><th>Sport</th><th>Event</th><th>Selection</th><th>Start</th><th>Price</th><th>Open on DK</th></tr></thead><tbody>"
+        for i, leg in enumerate(st.session_state.parlay):
+            level = safety_level_for_leg(leg)
+            color = color_for_level(level)
             sport = leg.get("sport") or ""
             start = leg.get("commence_time") or ""
+            title = leg.get("title") or ""
+            selection = leg.get("selection") or ""
+            price = leg.get("price") or ""
+            dk_url = build_draftkings_search_url(selection, title)
             picked_html += (
                 f"<tr>"
-                f"<td><span class='pill' style='background:{color}'>{sport}</span></td>"
-                f"<td>{leg.get('title','')}</td>"
-                f"<td><strong>{leg.get('selection','')}</strong></td>"
+                f"<td><span class='pill' style='background:{color}'>{level.title()}</span></td>"
+                f"<td>{sport}</td>"
+                f"<td>{title}</td>"
+                f"<td><strong>{selection}</strong></td>"
                 f"<td>{start}</td>"
-                f"<td>{leg.get('price')}</td>"
-                f"<td>{leg.get('reason','')}</td>"
+                f"<td>{price}</td>"
+                f"<td><a class='dk-link' href='{dk_url}' target='_blank' rel='noreferrer noopener'>Open on DraftKings</a></td>"
                 f"</tr>"
             )
         if not st.session_state.parlay:
-            picked_html += "<tr><td colspan='6'><em>No picks yet</em></td></tr>"
+            picked_html += "<tr><td colspan='7'><em>No picks yet</em></td></tr>"
         picked_html += "</tbody></table>"
         st.markdown(picked_html, unsafe_allow_html=True)
 
-    render_parlay_table()
+    render_parlay_table_with_links()
+
+    # Provide "open all" links (one tab per pick)
+    if st.session_state.parlay:
+        st.markdown("**Open all picks on DraftKings** (one tab per pick):")
+        for leg in st.session_state.parlay:
+            dk_url = build_draftkings_search_url(leg.get("selection",""), leg.get("title",""))
+            st.markdown(f"- [{leg.get('selection')} — {leg.get('title')}]({dk_url})", unsafe_allow_html=True)
 
     # Parlay controls
     if st.button("Clear parlay"):
