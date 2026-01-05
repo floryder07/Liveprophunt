@@ -1,16 +1,11 @@
 """
-Parlay Builder — TheOddsAPI prototype
+Parlay Builder — TheOddsAPI prototype (debug-friendly)
 
-Final merged file:
-- All helper functions defined before UI (no NameError).
-- auto_pick_legs_by_value and auto_pick_safest_legs included.
-- Ensures _sport_title is set for every loaded event.
-- Improved layout (Events / Auto-pick / Debug tabs) and persistent Parlay summary.
-- Debug panel included to inspect loaded events and sport titles.
-- Color-coded safety badges (green/orange/red) for picks.
-- "Open on DraftKings" search links for each pick and "open all" links.
-- No automatic bet placement (only opens DraftKings search pages).
-- Stable widget keys for Add/Remove buttons.
+This file:
+- Ensures _sport_title for loaded events
+- Auto-shows candidate pool when Preview finds no picks (no manual edits required)
+- Color-coded safety badges and DraftKings search links
+- All helper functions present before UI
 """
 from typing import Any, Dict, List, Optional
 import os
@@ -256,10 +251,6 @@ def auto_pick_safest_legs(
     require_bookmaker: Optional[str] = "draftkings",
     avoid_same_event: bool = True,
 ) -> List[Dict[str, Any]]:
-    """
-    Conservative picks: prefer outcomes with high consensus (implied prob),
-    low inter-book spread, and odds <= max_decimal_odds.
-    """
     candidates: List[Dict[str, Any]] = []
     for ev in events:
         if require_bookmaker:
@@ -330,10 +321,6 @@ def auto_pick_safest_legs(
 
 # --- New helper: ensure sport titles for events (fixes missing sport names) ---
 def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[str, Any]]) -> None:
-    """
-    Ensure each event in ev_list has a readable _sport_title.
-    Uses sports_list (from fetch_sports) to map keys to titles and checks common event fields.
-    """
     smap = {s.get("key"): s.get("title") for s in (sports_list or [])}
     for ev in ev_list:
         candidate_keys = [
@@ -351,23 +338,14 @@ def _ensure_sport_titles(ev_list: List[Dict[str, Any]], sports_list: List[Dict[s
 
 # ---- DraftKings link + safety helpers ----
 def build_draftkings_search_url(selection: str, event_title: str) -> str:
-    """
-    Build a DraftKings sportsbook search URL for the selection + event.
-    This opens DraftKings search with the query prefilled.
-    """
     query = f"{selection} {event_title}"
     encoded = quote_plus(query)
     return f"https://sportsbook.draftkings.com/search?query={encoded}"
 
-# Safety thresholds (tweak these as you like)
-SAFE_PROB_THRESHOLD = 0.60    # implied prob >= 60% -> safe (green)
-MIDDLE_PROB_THRESHOLD = 0.45  # implied prob >= 45% -> middle (orange)
+SAFE_PROB_THRESHOLD = 0.60
+MIDDLE_PROB_THRESHOLD = 0.45
 
 def safety_level_for_leg(leg: dict) -> str:
-    """
-    Return 'safe' | 'middle' | 'danger' based on safety_score or implied prob (1/price).
-    """
-    # prefer explicit safety_score if present (auto-pick safest adds it)
     if leg.get("safety_score") is not None:
         try:
             s = float(leg["safety_score"])
@@ -378,8 +356,6 @@ def safety_level_for_leg(leg: dict) -> str:
             return "danger"
         except Exception:
             pass
-
-    # fallback: implied probability from price
     try:
         p = 1.0 / float(leg.get("price", 0))
     except Exception:
@@ -392,9 +368,9 @@ def safety_level_for_leg(leg: dict) -> str:
 
 def color_for_level(level: str) -> str:
     return {
-        "safe": "#2ECC71",    # green
-        "middle": "#F39C12",  # orange
-        "danger": "#E74C3C",  # red
+        "safe": "#2ECC71",
+        "middle": "#F39C12",
+        "danger": "#E74C3C",
     }.get(level, "#999999")
 
 # ---- Session state defaults ----
@@ -407,14 +383,13 @@ if "events_page" not in st.session_state:
 
 # ---- Header ----
 st.markdown("# 🎯 Parlay Builder — TheOddsAPI prototype")
-st.markdown("Browse events on the left, review and manage your parlay on the right. Use Debug to inspect loaded feed.")
+st.markdown("Browse events on the left, review and manage your parlay on the right. Debug info shows automatically if auto-pick finds nothing.")
 
 # ---- Top controls row (Load / Sport selector) ----
 top_cols = st.columns([3, 2, 1])
 with top_cols[0]:
     st.info("Events browser / Auto-pick in left tabs; Parlay summary stays on the right.")
 with top_cols[1]:
-    # fetch sports list to populate sport selector and title mapping
     sport_options = []
     sport_titles = {}
     sports_list = []
@@ -452,7 +427,6 @@ with top_cols[2]:
                         ev["_sport_title"] = stitle
                     loaded = evs
 
-            # ensure sport titles exist for all events (use sports_list mapping & fallbacks)
             _ensure_sport_titles(loaded, sports_list)
             st.session_state.events = loaded
             st.session_state.events_page = 1
@@ -465,19 +439,15 @@ left_col, right_col = st.columns([2.5, 1])
 
 with left_col:
     tabs = st.tabs(["Events", "Auto-pick", "Debug"])
-    # ---------- Events tab ----------
+    # Events tab (same as before)
     with tabs[0]:
         st.subheader("Events browser")
-
-        # Search & filters
         search_text = st.text_input("Search (event title, team, selection)", value="")
         sport_filter = st.selectbox(
             "Filter by sport",
             options=["All"] + sorted(list({ev.get("_sport_title") or ev.get("_sport_key") or "Unknown" for ev in st.session_state.events}))
         )
         sort_by = st.selectbox("Sort by", options=["Start time", "Odds value (best uplift)", "Sport", "Title"])
-
-        # Pagination controls
         page_size = st.number_input("Events per page", min_value=2, max_value=50, value=8, step=1)
         total_events = len(st.session_state.events)
         total_pages = max(1, (total_events + page_size - 1) // page_size)
@@ -489,7 +459,6 @@ with left_col:
             st.session_state.events_page = min(total_pages, page + 1)
         pg_cols[2].markdown(f"Page {st.session_state.events_page} / {total_pages} — {total_events} events")
 
-        # Filter & search logic
         filtered = []
         for ev in st.session_state.events:
             sport_title = ev.get("_sport_title") or ev.get("_sport_key") or ""
@@ -507,7 +476,6 @@ with left_col:
                 continue
             filtered.append(ev)
 
-        # sort
         def event_value(ev):
             uplifts = []
             for o in get_consensus_and_best_outcomes(ev):
@@ -526,7 +494,6 @@ with left_col:
         elif sort_by == "Title":
             filtered.sort(key=lambda e: e.get("title") or "")
 
-        # Pagination slice
         start = (st.session_state.events_page - 1) * page_size
         end = start + page_size
         page_events = filtered[start:end]
@@ -542,7 +509,6 @@ with left_col:
                 header = f"{sport_title} — {title}"
                 with st.expander(header):
                     st.markdown(f"*starts:* {commence}")
-                    # show outcomes grouped by market/bookmaker
                     for bm in ev.get("bookmakers", []):
                         bm_key = bm.get("key") or bm.get("title") or "bookmaker"
                         for m in bm.get("markets", []):
@@ -577,19 +543,15 @@ with left_col:
                                     else:
                                         st.session_state.parlay.append(add_leg)
 
-    # ---------- Auto-pick tab ----------
+    # Auto-pick tab with auto-debugging when no picks found
     with tabs[1]:
         st.subheader("Auto-pick (value & safety)")
         st.write("Configure auto-pick options and preview picks before adding.")
-        # value pick controls
-        st.markdown("**Value-based picks**")
         auto_n = st.number_input("Number of legs to pick", min_value=1, max_value=10, value=3)
         auto_min_pct = st.slider("Minimum uplift vs consensus (%)", min_value=0, max_value=50, value=2)
         auto_min_value = auto_min_pct / 100.0
         avoid_same_event = st.checkbox("Avoid >1 leg per event", value=True)
         preview_only = st.checkbox("Preview only (don't auto-add)", value=True)
-
-        # safety pick controls
         st.markdown("**Safety picks (conservative)**")
         max_decimal_odds = st.number_input("Max decimal odds per leg", value=1.8, step=0.05, format="%.2f")
         min_consensus_prob = st.slider("Minimum consensus implied probability (%)", min_value=30, max_value=90, value=60) / 100.0
@@ -625,14 +587,27 @@ with left_col:
             return s_events
 
         col_ap = st.columns([1, 1, 2])
+        # Preview value picks
         if col_ap[0].button("Preview value picks"):
             picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
             if not picks:
-                st.warning("No value picks found.")
+                st.warning("No value picks found with current filters — showing top candidate pool (debug):")
+                # automatic debug: show top candidate pool (min_value=0)
+                cand = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=200, min_value=0.0, avoid_same_event=False)
+                st.write("Candidate count (uplift >= 0):", len(cand))
+                for i, c in enumerate(cand[:40]):
+                    sport = c.get("sport_title") or c.get("sport_key") or ""
+                    title = c.get("event_title") or ""
+                    selection = c.get("selection") or ""
+                    price = c.get("price")
+                    uplift_pct = c.get("value", 0) * 100.0
+                    implied = c.get("implied_consensus") or 0.0
+                    st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | uplift {uplift_pct:.2f}% | implied {implied:.3f}")
             else:
                 for p in picks:
                     st.markdown(f"**{p.get('sport_title') or p.get('sport_key') or ''}** — {p['event_title']}  \n"
                                 f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}")
+        # Add value picks
         if col_ap[1].button("Add value picks"):
             picks = auto_pick_legs_by_value(_auto_pick_source_events(), n_legs=int(auto_n), min_value=auto_min_value, avoid_same_event=avoid_same_event)
             if not picks:
@@ -653,7 +628,7 @@ with left_col:
                         })
                         added += 1
                 st.success(f"Added {added} picks to parlay.")
-
+        # Preview safest picks (with auto-debug if none)
         if col_ap[2].button("Preview safest picks"):
             picks = auto_pick_safest_legs(
                 _auto_pick_source_events(),
@@ -665,11 +640,30 @@ with left_col:
                 avoid_same_event=avoid_same_event
             )
             if not picks:
-                st.warning("No safe picks found.")
+                st.warning("No safe picks found with current filters — showing top safe candidates (relaxed debug):")
+                cand = auto_pick_safest_legs(
+                    _auto_pick_source_events(),
+                    n_legs=200,
+                    max_decimal_odds=5.0,
+                    min_consensus_prob=0.0,
+                    max_spread_pct=1.0,
+                    require_bookmaker=None,
+                    avoid_same_event=False
+                )
+                st.write("Safe candidate count (relaxed):", len(cand))
+                for i, c in enumerate(cand[:40]):
+                    sport = c.get("sport_title") or ""
+                    title = c.get("event_title") or ""
+                    selection = c.get("selection") or ""
+                    price = c.get("price")
+                    implied = c.get("implied_consensus") or 0.0
+                    spread = c.get("spread_pct") or 0.0
+                    st.write(f"{i+1}. [{sport}] {title} — {selection} @ {price} | implied {implied:.3f} | spread {spread:.3f}")
             else:
                 for p in picks:
                     st.markdown(f"**{p.get('sport_title') or ''}** — {p['event_title']}  \n"
                                 f"> **{p['selection']}**  @ {p['price']}  — {p['reason']}")
+        # Add safest picks
         if st.button("Add safest picks"):
             picks = auto_pick_safest_legs(
                 _auto_pick_source_events(),
@@ -699,7 +693,7 @@ with left_col:
                         added += 1
                 st.success(f"Added {added} safe picks to parlay.")
 
-    # ---------- Debug tab ----------
+    # Debug tab
     with tabs[2]:
         with st.expander("⚠️ Debug (raw events & session)", expanded=False):
             st.write("Events loaded:", len(st.session_state.events))
@@ -765,7 +759,7 @@ with right_col:
         st.session_state.parlay = []
         st.success("Parlay cleared.")
 
-    # Show detailed list with remove buttons
+    # Manage picks
     st.subheader("Manage picks")
     if not st.session_state.parlay:
         st.info("No picks to manage.")
@@ -791,7 +785,6 @@ with right_col:
         st.metric("Combined decimal odds", f"{combined:.4f}")
         st.metric("Potential payout", f"${payout:,.2f}")
         st.metric("Potential profit", f"${profit:,.2f}")
-        # Export JSON
         if st.button("Export parlay JSON"):
             st.download_button("Download JSON", data=json.dumps(st.session_state.parlay, default=str, indent=2), file_name="parlay.json", mime="application/json")
     else:
