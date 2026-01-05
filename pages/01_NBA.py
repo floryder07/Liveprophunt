@@ -43,7 +43,7 @@ data_source = st.sidebar.selectbox(
 # CSV upload
 csv_file = None
 if data_source == "CSV upload":
-    csv_file = st.sidebar.file_uploader("Upload CSV (columns: name,stat_label,live_value,delta,target,pace)", type=["csv"])
+    csv_file = st.sidebar.file_uploader("Upload CSV (columns: name,stat_label,live_value,delta,target,pace,team,money)", type=["csv"])
 
 # CSV URL / Google Sheet (public CSV export link)
 csv_url = ""
@@ -61,13 +61,18 @@ if data_source == "REST API (JSON)":
     api_token = st.sidebar.text_input("Bearer token (optional)", value="", type="password")
     st.sidebar.markdown(
         "Expected JSON shape: list of objects with keys: "
-        "`name`, `stat_label`, `live_value`, `delta`, `target`, `pace` (or compatible keys)."
+        "`name`, `stat_label`, `live_value`, `delta`, `target`, `pace`, optionally `team` and `money`."
     )
 
 # Display options
 num_cols = st.sidebar.selectbox("Columns", options=[1, 2, 3], index=1)
 show_pace = st.sidebar.checkbox("Show pace", value=True)
 show_target = st.sidebar.checkbox("Show target", value=True)
+
+# Top-safe picks options
+st.sidebar.markdown("Top-safe picks")
+enable_top_safest = st.sidebar.checkbox("Show Top N safest picks", value=True)
+top_n = st.sidebar.number_input("Top N", min_value=1, max_value=20, value=5, step=1)
 
 # Auto-refresh options
 st.sidebar.markdown("Auto-refresh:")
@@ -159,6 +164,10 @@ def to_player_record(raw: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pace = None
 
+    # Optional fields: team and money (odds)
+    team = raw.get("team") or raw.get("team_name") or raw.get("teamName") or raw.get("side") or None
+    money = raw.get("money") or raw.get("moneyline") or raw.get("odds") or raw.get("price") or None
+
     return {
         "name": str(name),
         "stat_label": str(stat_label),
@@ -166,25 +175,27 @@ def to_player_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         "delta": str(delta),
         "target": target,
         "pace": pace,
+        "team": team,
+        "money": money,
     }
 
 
 # --- Default players (if using Mock or editing in UI) ------------------------
 DEFAULT_PLAYERS = [
-    {"name": "LeBron James", "stat_label": "Points", "live_value": 22, "delta": "+2.5 vs Line", "target": 19.5, "pace": 28.1},
-    {"name": "Kevin Durant", "stat_label": "Rebounds", "live_value": 6, "delta": "-1.5 vs Line", "target": 7.5, "pace": 6.8},
+    {"name": "LeBron James", "stat_label": "Points", "live_value": 22, "delta": "+2.5 vs Line", "target": 19.5, "pace": 28.1, "team": "LAL", "money": "-135"},
+    {"name": "Kevin Durant", "stat_label": "Rebounds", "live_value": 6, "delta": "-1.5 vs Line", "target": 7.5, "pace": 6.8, "team": "PHX", "money": "+120"},
 ]
 
 
 # --- Parse/edit players (text area) -----------------------------------------
 st.sidebar.markdown("Edit players (one per line):")
 players_text_default = "\n".join(
-    f"{p['name']}|{p['stat_label']}|{p['live_value']}|{p['delta']}|{p['target']}|{p['pace']}" for p in DEFAULT_PLAYERS
+    f"{p['name']}|{p['stat_label']}|{p['live_value']}|{p['delta']}|{p['target']}|{p['pace']}|{p.get('team','')}|{p.get('money','')}" for p in DEFAULT_PLAYERS
 )
 players_text = st.sidebar.text_area(
-    "Format: name|stat_label|live_value|delta|target|pace",
+    "Format: name|stat_label|live_value|delta|target|pace|team|money",
     value=players_text_default,
-    height=140,
+    height=160,
 )
 
 # Parse players_text into player dicts
@@ -202,7 +213,11 @@ live_players_map: Dict[str, Dict[str, Any]] = {}
 for r in raw_live:
     try:
         rec = to_player_record(r)
-        live_players_map[rec["name"].lower()] = rec
+        # use lowercase name key for matching; include team in key if present to avoid collisions
+        key = f"{rec['name'].lower()}"
+        if rec.get("team"):
+            key = f"{key}|{str(rec.get('team')).lower()}"
+        live_players_map[key] = rec
     except Exception:
         logger.exception("Skipping malformed record: %s", r)
 
@@ -210,7 +225,14 @@ for r in raw_live:
 merged_players: List[Dict[str, Any]] = []
 for p in user_players:
     name_key = p["name"].lower()
+    # try match with and without team
     live = live_players_map.get(name_key, {})
+    if not live:
+        # search for any live entry with matching name prefix (best-effort)
+        for k, v in live_players_map.items():
+            if k.split("|")[0] == name_key:
+                live = v
+                break
     merged = dict(p)  # copy
     # override fields if present in live data
     if live.get("live_value") not in (None, ""):
@@ -221,6 +243,10 @@ for p in user_players:
         merged["target"] = live["target"]
     if live.get("pace") not in (None, ""):
         merged["pace"] = live["pace"]
+    if live.get("team"):
+        merged["team"] = live["team"]
+    if live.get("money"):
+        merged["money"] = live["money"]
     merged_players.append(merged)
 
 # If no players found in UI, fallback to defaults (useful for demo)
@@ -236,6 +262,46 @@ if auto_refresh_enabled:
     except Exception:
         # streamlit-autorefresh not installed: show a hint and rely on manual refresh button
         st.sidebar.info("Install 'streamlit-autorefresh' to enable true client-side auto-refresh.")
+
+
+# --- Safety scoring / ranking ----------------------------------------------
+def compute_safety_score(player: Dict[str, Any]) -> float:
+    """
+    Compute a safety score for a player prop.
+    Returns a numeric score where higher means 'safer' to take (0..~200).
+    Heuristic used:
+      - If numeric live_value and numeric target:
+          * If live_value >= target: reward (already hitting/exceeding target) => base 120 + (difference * 10) [capped]
+          * If live_value < target: score = 100 - (target - live_value) * 10 (closer => higher)
+      - If missing numeric fields: lower score (40).
+    This is intentionally simple — tweak to fit your own definition of "safe".
+    """
+    lv = player.get("live_value")
+    target = player.get("target")
+    try:
+        if isinstance(lv, (int, float)) and isinstance(target, (int, float)):
+            diff = lv - target
+            if diff >= 0:
+                # already at/above target: consider as very safe (greater is safer)
+                return min(200.0, 120.0 + diff * 10.0)
+            else:
+                # below target: closer -> safer
+                return max(0.0, 100.0 - abs(diff) * 10.0)
+    except Exception:
+        pass
+    # fallback for non-numeric or missing values
+    return 40.0
+
+
+def get_top_safest(players_list: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
+    scored = []
+    for p in players_list:
+        score = compute_safety_score(p)
+        p_copy = dict(p)
+        p_copy["_safety_score"] = score
+        scored.append(p_copy)
+    scored_sorted = sorted(scored, key=lambda x: x["_safety_score"], reverse=True)
+    return scored_sorted[:n]
 
 
 # --- UI helpers ---------------------------------------------------------------
@@ -288,6 +354,14 @@ def render_player_card(player: Dict[str, Any], show_pace: bool = True, show_targ
     if show_pace and player.get("pace") not in (None, ""):
         caption_parts.append(f"Pace: {player.get('pace')}")
 
+    # optional team/money
+    team = player.get("team")
+    money = player.get("money")
+    if team:
+        caption_parts.append(f"Team: {team}")
+    if money:
+        caption_parts.append(f"Money: {money}")
+
     if caption_parts:
         st.caption(" | ".join(caption_parts))
 
@@ -299,6 +373,44 @@ col_refresh, _ = st.columns([1, 6])
 with col_refresh:
     if st.button("Refresh now"):
         st.experimental_rerun()
+
+# Top safest picks (if enabled)
+if enable_top_safest:
+    st.subheader(f"Top {int(top_n)} Safest Picks — Ranked")
+    top_safest = get_top_safest(players, int(top_n))
+    if not top_safest:
+        st.info("No players available to rank.")
+    else:
+        # present as a compact table with rank and key fields
+        rows = []
+        for i, p in enumerate(top_safest, start=1):
+            rows.append(
+                {
+                    "rank": i,
+                    "name": p.get("name"),
+                    "team": p.get("team") or "",
+                    "stat": p.get("stat_label"),
+                    "live": p.get("live_value"),
+                    "target": p.get("target"),
+                    "pace": p.get("pace"),
+                    "delta": p.get("delta"),
+                    "money": p.get("money") or "",
+                    "safety_score": round(p.get("_safety_score", 0.0), 1),
+                }
+            )
+        df_top = pd.DataFrame(rows)
+        # Show as dataframe and also show a little expanded view below
+        st.table(df_top)
+
+        # Expandable detailed view for each ranked pick
+        with st.expander("Show detailed cards for Top picks"):
+            cols = st.columns(min(3, max(1, len(top_safest))))
+            for idx, pl in enumerate(top_safest):
+                c = cols[idx % len(cols)]
+                with c:
+                    st.markdown(f"#### #{idx+1} — {pl.get('name')}")
+                    render_player_card(pl, show_pace=show_pace, show_target=show_target)
+                    st.write(f"Safety score: {round(pl.get('_safety_score', 0.0),1)}")
 
 if not players:
     st.info("No players configured. Use the sidebar to add players or select a data source.")
@@ -313,7 +425,7 @@ else:
 st.write("---")
 st.caption(
     "Notes: \n"
-    "- Use the sidebar to select a data source (Mock/CSV/URL/REST).\n"
-    "- For Google Sheets, use the sheet's CSV export URL (export?format=csv).\n"
-    "- To enable client-side auto-refresh install: pip install streamlit-autorefresh"
+    "- This 'safest picks' ranking uses a simple heuristic based on live value vs target. It performs best when both live_value and target are numeric.\n"
+    "- You can edit/override players in the sidebar text area or supply CSV/JSON with optional `team` and `money` fields.\n"
+    "- To change the ranking behavior, tell me the exact rules you'd like (e.g., weigh pace more, prefer players already over the line, integrate implied probability from moneyline, etc.)"
 )
