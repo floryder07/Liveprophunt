@@ -1,22 +1,19 @@
 import streamlit as st
+import requests  # You'll need this to talk to the Sports API
 
-# 1. Set the page title that appears in the browser tab
-st.set_page_config(page_title="Proplivehunter", page_icon="🚀")
+st.title("🔥 Live Player Prop Tracker")
 
-# 2. Add a main title and some text
-st.title("Liveprophunter!")
-st.write("If you can see this, you have successfully fixed the file error.")
+# This part refreshes every 30 seconds automatically
+@st.fragment(run_every="30s")
+def live_prop_updates():
+    # 1. This is where you would call your API (e.g., The Odds API)
+    # For now, we simulate the "Live Price" or "Current Stat"
+    st.subheader("Current Live Lines")
+    
+    col1, col2 = st.columns(2)
+    col1.metric("LeBron James Points", "24.5", delta="+1.5")
+    col2.metric("Kevin Durant Rebounds", "7.5", delta="-0.5")
+    
+    st.caption("Live updates every 30 seconds...")
 
-# 3. Add an interactive widget (a text input box)
-name = st.text_input("Enter your name:")
-
-# 4. Add a button that reacts when clicked
-if st.button("Say Hello"):
-    if name:
-        st.success(f"Hello, {name}! Your Streamlit app is live.")
-    else:
-        st.warning("Please enter a name first!")
-
-# 5. Add a simple sidebar for extra info
-st.sidebar.header("About This Site")
-st.sidebar.info("Built with Python and Streamlit in 2026.")
+live_prop_updates()
